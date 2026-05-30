@@ -1,0 +1,525 @@
+import {
+  CHANNEL,
+  isToPageMessage,
+  type MaskStyle,
+  type PageCommand,
+  type PageEvent,
+  type ShareStatus,
+} from "@/lib/messages";
+import {
+  clampRectToCanvas,
+  fromNormalizedRect,
+  isRectInViewport,
+  scaleViewportRect,
+  toNormalizedRect,
+  type NormRect,
+  type Rect,
+} from "@/lib/masking";
+import { buildSnapshot, type ElementMeta } from "@/lib/dom-snapshot";
+import { computeDownscaleSize } from "@/lib/image";
+
+// MAIN world で動く本体。
+// navigator.mediaDevices.getDisplayMedia を差し替え、返ってきた映像を <canvas> で
+// 1フレームずつ加工してマスクをかけ、加工後の MediaStream をアプリ(Meet/Zoom 等)へ返す。
+//
+//  - アプリに渡すのは加工後 stream。相手の映像と Meet のセルフプレビューはマスクされる。
+//    マスクされないのは "実際に作業している本物のタブ画面" だけ。
+//  - 要素 -> 映像ピクセルの座標対応は自タブ共有(displaySurface === 'browser')でのみ正確。
+//  - 構築失敗時は生 stream を返さず例外を投げる(fail-closed)。漏れるより共有失敗を選ぶ。
+//
+// MAIN world なので chrome.* / browser.* は使えない。通信は window.postMessage のみ。
+
+export default defineContentScript({
+  matches: ["<all_urls>"],
+  runAt: "document_start",
+  world: "MAIN",
+  main() {
+    const state = {
+      sharing: false,
+      enabled: true,
+      forceAll: false,
+      style: "blur" as MaskStyle,
+      blurPx: 18,
+      selectors: new Set<string>(), // 手動セレクタ
+      autoSelectors: new Set<string>(), // Nano 自動検知セレクタ（別枠）
+      surface: null as string | null,
+      videoW: 0, // キャプチャ映像の寸法（ソースタブ対応付け用）
+      videoH: 0,
+      remoteRects: [] as NormRect[], // 別タブ共有時、共有される側から届いた正規化 rect
+      crossTab: false, // 別タブ共有か（true ならローカル DOM マスクは使わず remote のみ）
+    };
+
+    // 段階2(画像)検知のために、稼働中パイプラインの canvas を参照しておく。
+    let currentCanvas: HTMLCanvasElement | null = null;
+
+    // leading + trailing throttle。scroll 中の publish を間引く。
+    function throttle(fn: () => void, ms: number): () => void {
+      let last = 0;
+      let timer: number | null = null;
+      return () => {
+        const now = performance.now();
+        const wait = ms - (now - last);
+        if (wait <= 0) {
+          last = now;
+          fn();
+        } else if (timer === null) {
+          timer = window.setTimeout(() => {
+            timer = null;
+            last = performance.now();
+            fn();
+          }, wait);
+        }
+      };
+    }
+
+    function emit(evt: PageEvent): void {
+      window.postMessage({ channel: CHANNEL, dir: "to-content", evt }, "*");
+    }
+
+    function emitStatus(): void {
+      const status: ShareStatus = {
+        sharing: state.sharing,
+        enabled: state.enabled,
+        forceAll: state.forceAll,
+        style: state.style,
+        blurPx: state.blurPx,
+        surface: state.surface,
+        selectors: [...state.selectors],
+        autoSelectors: [...state.autoSelectors],
+      };
+      emit({ type: "status", status });
+    }
+
+    // 文字ノードの直下テキストだけを取る（子孫の全文連結を避けてノイズを減らす）。
+    function directText(el: Element): string {
+      let t = "";
+      for (const node of el.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) t += node.textContent ?? "";
+      }
+      return t.trim();
+    }
+
+    // 段階1: ビューポート内の候補要素から DOM スナップショットを作る。
+    // Nano の初回応答を速く保つため小さめに抑える（大きいほど遅い）。
+    function collectDomSnapshot(maxChars = 3500): string {
+      const metas: ElementMeta[] = [];
+      const all = document.body?.querySelectorAll("*") ?? [];
+      let scanned = 0;
+      for (const el of all) {
+        if (scanned >= 1200 || metas.length >= 120) break;
+        scanned++;
+        const rect = el.getBoundingClientRect();
+        if (!isRectInViewport(rect, window.innerWidth, window.innerHeight)) {
+          continue;
+        }
+        const tag = el.tagName.toLowerCase();
+        const isInput =
+          tag === "input" || tag === "textarea" || tag === "select";
+        const text = directText(el);
+        const id = el.id || undefined;
+        const dataKeys = el
+          .getAttributeNames()
+          .filter((n) => n.startsWith("data-"));
+        const ariaLabel = el.getAttribute("aria-label") ?? undefined;
+        // 機密の手がかりが何も無い要素は除外（ノイズ削減）
+        const hasSignal =
+          isInput ||
+          !!id ||
+          dataKeys.length > 0 ||
+          !!ariaLabel ||
+          (!!text && text.length <= 120);
+        if (!hasSignal) continue;
+        metas.push({
+          tag,
+          id,
+          classes: el.classList.length ? [...el.classList] : undefined,
+          role: el.getAttribute("role") ?? undefined,
+          ariaLabel,
+          name: el.getAttribute("name") ?? undefined,
+          inputType: isInput ? (el.getAttribute("type") ?? tag) : undefined,
+          dataKeys: dataKeys.length ? dataKeys : undefined,
+          text: text && text.length <= 120 ? text : undefined,
+        });
+      }
+      return buildSnapshot(metas, maxChars);
+    }
+
+    // 段階2: 稼働中 canvas を縮小して JPEG dataURL 文字列にする（runtime 経由で運ぶため）。
+    // 未共有(canvas 無し)/tainted の場合は null を返し、段階2をスキップさせる。
+    function sampleFrame(maxEdge = 1024): string | null {
+      if (!currentCanvas?.width || !currentCanvas.height) return null;
+      const { width, height } = computeDownscaleSize(
+        currentCanvas.width,
+        currentCanvas.height,
+        maxEdge,
+      );
+      if (!width || !height) return null;
+      const off = document.createElement("canvas");
+      off.width = width;
+      off.height = height;
+      const octx = off.getContext("2d");
+      if (!octx) return null;
+      octx.drawImage(currentCanvas, 0, 0, width, height);
+      try {
+        return off.toDataURL("image/jpeg", 0.7);
+      } catch {
+        return null; // tainted canvas 等は段階2をスキップ
+      }
+    }
+
+    window.addEventListener("message", (e: MessageEvent) => {
+      if (e.source !== window) return;
+      if (!isToPageMessage(e.data)) return;
+      handleCommand(e.data.cmd);
+    });
+
+    function handleCommand(cmd: PageCommand): void {
+      // 高頻度コマンドは status を撒かない（早期 return）。
+      if (cmd.type === "set-remote-rects") {
+        state.remoteRects = cmd.rects;
+        state.crossTab = cmd.crossTab;
+        return;
+      }
+
+      switch (cmd.type) {
+        case "set-enabled":
+          state.enabled = cmd.enabled;
+          break;
+        case "toggle-enabled":
+          state.enabled = !state.enabled;
+          break;
+        case "set-force-all":
+          state.forceAll = cmd.forceAll;
+          break;
+        case "toggle-force-all":
+          state.forceAll = !state.forceAll;
+          break;
+        case "set-style":
+          state.style = cmd.style;
+          if (typeof cmd.blurPx === "number") state.blurPx = cmd.blurPx;
+          break;
+        case "add-selector":
+          state.selectors.add(cmd.selector);
+          updatePublishing();
+          break;
+        case "remove-selector":
+          state.selectors.delete(cmd.selector);
+          updatePublishing();
+          break;
+        case "set-selectors":
+          state.selectors = new Set(cmd.selectors);
+          updatePublishing();
+          break;
+        case "clear-selectors":
+          state.selectors.clear();
+          updatePublishing();
+          break;
+        case "run-detection": {
+          const snapshot = collectDomSnapshot();
+          const dataUrl = cmd.includeImage ? sampleFrame() : null;
+          emit({ type: "detect-payload", snapshot, dataUrl });
+          break;
+        }
+        case "set-auto-selectors":
+          state.autoSelectors = new Set(cmd.selectors);
+          updatePublishing();
+          break;
+        case "clear-auto-selectors":
+          state.autoSelectors.clear();
+          updatePublishing();
+          break;
+        case "get-status":
+          break;
+      }
+      emitStatus();
+    }
+
+    // ---- クロスタブ: このタブ(共有される側)の機密 rect を publish する ----
+    function computeNormalizedRects(): NormRect[] {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const out: NormRect[] = [];
+      for (const sel of new Set([...state.selectors, ...state.autoSelectors])) {
+        let els: NodeListOf<Element>;
+        try {
+          els = document.querySelectorAll(sel);
+        } catch {
+          continue;
+        }
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (!isRectInViewport(r, vw, vh)) continue;
+          const n = toNormalizedRect(r, vw, vh);
+          if (n) out.push(n);
+        }
+      }
+      return out;
+    }
+
+    function isArmed(): boolean {
+      return state.selectors.size > 0 || state.autoSelectors.size > 0;
+    }
+
+    // 直前に publish した内容の JSON。変化したときだけ送る（churn 抑制 + 空配信漏れ防止）。
+    let lastPublishedJson = "";
+    function publishRects(): void {
+      const armed = isArmed();
+      const rects = computeNormalizedRects();
+      const json = JSON.stringify({ armed, rects });
+      if (json === lastPublishedJson) return; // 変化が無ければ送らない
+      lastPublishedJson = json;
+      emit({
+        type: "publish-rects",
+        rects,
+        aspect: window.innerWidth / Math.max(1, window.innerHeight),
+        armed,
+      });
+    }
+
+    const schedulePublish = throttle(publishRects, 120);
+    let publishTick: number | null = null;
+    // 機密セレクタを持つ間だけ低頻度 tick を回す。無くなったら空を1回送って停止。
+    function updatePublishing(): void {
+      if (isArmed()) {
+        publishRects();
+        if (publishTick === null) {
+          publishTick = window.setInterval(publishRects, 600);
+        }
+      } else {
+        if (publishTick !== null) {
+          clearInterval(publishTick);
+          publishTick = null;
+        }
+        publishRects(); // 空を送って capturer 側のリモートマスクを消す
+      }
+    }
+
+    window.addEventListener("scroll", schedulePublish, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener("resize", schedulePublish, { passive: true });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) schedulePublish();
+    });
+
+    // ---- パイプライン ----
+    interface Pipeline {
+      outStream: MediaStream;
+      stop: () => void;
+      started: Promise<void>;
+    }
+    let pipeline: Pipeline | null = null;
+
+    function startPipeline(srcStream: MediaStream): Pipeline {
+      const videoTrack = srcStream.getVideoTracks()[0];
+      if (!videoTrack) throw new Error("video track が見つかりません");
+      const settings = videoTrack.getSettings();
+      state.surface = settings.displaySurface ?? "unknown";
+      state.videoW = settings.width ?? 0;
+      state.videoH = settings.height ?? 0;
+
+      const video = document.createElement("video");
+      video.srcObject = new MediaStream([videoTrack]);
+      video.muted = true;
+      video.playsInline = true;
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) throw new Error("2D コンテキストを取得できません");
+      currentCanvas = canvas;
+
+      const fps = Math.min(settings.frameRate ?? 30, 30);
+      let rvfcHandle: number | null = null;
+      let rafHandle: number | null = null;
+      let running = true;
+
+      function sizeToVideo(): void {
+        if (
+          video.videoWidth &&
+          (canvas.width !== video.videoWidth ||
+            canvas.height !== video.videoHeight)
+        ) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+        }
+      }
+
+      // 表示中の要素のマスク矩形(canvas ピクセル系)。
+      // タブ共有時のみ、ビューポート/正規化座標 -> 映像ピクセルへマッピングできる。
+      function maskRects(): Rect[] {
+        if (state.surface !== "browser") return [];
+
+        // 別タブ共有: 共有される側から届いた rect のみ。
+        // このタブ(capturer)のローカル DOM は共有内容と無関係なので使わない
+        // （使うと capturer 自身の要素を別タブの映像に重ねて誤マスクする）。
+        if (state.crossTab) {
+          const rects: Rect[] = [];
+          for (const n of state.remoteRects) {
+            rects.push(fromNormalizedRect(n, canvas.width, canvas.height));
+          }
+          return rects;
+        }
+
+        // 自タブ共有: このタブ自身の機密要素（手動 + 自動）をローカル DOM から。
+        const rects: Rect[] = [];
+        const scaleX = canvas.width / window.innerWidth;
+        const scaleY = canvas.height / window.innerHeight;
+        for (const sel of new Set([...state.selectors, ...state.autoSelectors])) {
+          let els: NodeListOf<Element>;
+          try {
+            els = document.querySelectorAll(sel);
+          } catch {
+            continue; // 不正なセレクタはスキップ
+          }
+          for (const el of els) {
+            const r = el.getBoundingClientRect();
+            if (!isRectInViewport(r, window.innerWidth, window.innerHeight)) {
+              continue;
+            }
+            rects.push(scaleViewportRect(r, scaleX, scaleY));
+          }
+        }
+        return rects;
+      }
+
+      function applyMask(rc: Rect): void {
+        const c = clampRectToCanvas(rc, canvas.width, canvas.height);
+        if (!c) return;
+
+        if (state.style === "black") {
+          ctx!.fillStyle = "#000";
+          ctx!.fillRect(c.x, c.y, c.w, c.h);
+          return;
+        }
+        // blur: 対象領域だけクリップしてぼかしフィルタで映像を再描画
+        ctx!.save();
+        ctx!.filter = `blur(${state.blurPx}px)`;
+        ctx!.beginPath();
+        ctx!.rect(c.x, c.y, c.w, c.h);
+        ctx!.clip();
+        ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+        ctx!.restore();
+      }
+
+      function drawFrame(): void {
+        if (!running) return;
+        sizeToVideo();
+        if (canvas.width && canvas.height) {
+          ctx!.filter = "none";
+          ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+          if (state.enabled) {
+            if (state.forceAll) {
+              applyMask({ x: 0, y: 0, w: canvas.width, h: canvas.height });
+            } else {
+              for (const rc of maskRects()) applyMask(rc);
+            }
+          }
+        }
+        scheduleNext();
+      }
+
+      function scheduleNext(): void {
+        if (!running) return;
+        if (typeof video.requestVideoFrameCallback === "function") {
+          rvfcHandle = video.requestVideoFrameCallback(drawFrame);
+        } else {
+          rafHandle = requestAnimationFrame(drawFrame);
+        }
+      }
+
+      const outStream = canvas.captureStream(fps);
+      for (const audio of srcStream.getAudioTracks()) outStream.addTrack(audio);
+
+      function stop(): void {
+        running = false;
+        if (rvfcHandle !== null && video.cancelVideoFrameCallback) {
+          video.cancelVideoFrameCallback(rvfcHandle);
+        }
+        if (rafHandle !== null) cancelAnimationFrame(rafHandle);
+        for (const t of outStream.getVideoTracks()) t.stop();
+        video.srcObject = null;
+        if (currentCanvas === canvas) currentCanvas = null;
+      }
+
+      // ユーザーがブラウザUIから共有停止 -> 元トラックが ended -> 後始末
+      videoTrack.addEventListener("ended", () => {
+        state.sharing = false;
+        state.remoteRects = []; // 共有終了でリモートマスクを破棄
+        state.crossTab = false;
+        stop();
+        emit({ type: "share-ended" });
+        emitStatus();
+      });
+
+      const started = video
+        .play()
+        .then(() => {
+          sizeToVideo();
+          scheduleNext();
+        })
+        .catch((err: unknown) => {
+          stop();
+          throw new Error(`video.play failed: ${String(err)}`);
+        });
+
+      return { outStream, stop, started };
+    }
+
+    // ---- getDisplayMedia 差し替え ----
+    const md = navigator.mediaDevices;
+    if (md && typeof md.getDisplayMedia === "function") {
+      const original = md.getDisplayMedia.bind(md);
+
+      md.getDisplayMedia = async function (
+        constraints?: DisplayMediaStreamOptions,
+      ): Promise<MediaStream> {
+        const srcStream = await original(constraints);
+
+        // 音声のみ共有(画面トラックなし)はそのまま通す
+        if (srcStream.getVideoTracks().length === 0) return srcStream;
+
+        try {
+          if (pipeline) pipeline.stop();
+          pipeline = startPipeline(srcStream);
+          await pipeline.started; // play 失敗ならここで throw
+          state.sharing = true;
+          emit({
+            type: "share-started",
+            surface: state.surface ?? "unknown",
+            videoW: state.videoW,
+            videoH: state.videoH,
+          });
+          emitStatus();
+          if (state.surface !== "browser") {
+            emit({
+              type: "warning",
+              code: "non-tab-surface",
+              surface: state.surface ?? "unknown",
+              message:
+                "タブ共有以外では要素単位のマスクはできません。緊急の全面マスクのみ有効です。",
+            });
+          }
+          return pipeline.outStream;
+        } catch (err) {
+          // fail-closed: 生 stream は返さず共有を失敗させる
+          for (const t of srcStream.getTracks()) t.stop();
+          state.sharing = false;
+          emit({ type: "error", where: "startPipeline", message: String(err) });
+          emitStatus();
+          throw err;
+        }
+      };
+
+      emit({ type: "ready" });
+      // bridge(ISOLATED) が後にロードして 'ready' を取りこぼす競合に備え、もう一度送る
+      setTimeout(() => emit({ type: "ready" }), 0);
+    } else {
+      emit({
+        type: "error",
+        where: "init",
+        message: "getDisplayMedia が見つかりません",
+      });
+    }
+  },
+});
