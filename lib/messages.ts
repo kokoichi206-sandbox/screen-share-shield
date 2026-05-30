@@ -77,12 +77,16 @@ export type PageCommand =
   | { type: "clear-selectors" }
   // AI 自動検知トリガ: inject に DOM スナップショット(と任意で現フレーム)を集めさせる
   | { type: "run-detection"; includeImage: boolean }
-  // 自動検知結果の反映（手動 selectors とは別枠）
-  | { type: "set-auto-selectors"; selectors: string[] }
+  // 自動検知結果の反映（手動 selectors とは別枠）。id は検知の世代で、inject 側で
+  // 最新の検知に対する結果だけを採用し、順序逆転による古い結果の適用を防ぐ。
+  | { type: "set-auto-selectors"; selectors: string[]; id: number }
   | { type: "clear-auto-selectors" }
   // クロスタブ: 共有元(capturer)が、armed な全タブの正規化 rect(集約)を受け取り適用する。
   // capturer は常に「ローカル DOM ∪ これらの remote rect」をマスクする(fail-closed)。
   | { type: "set-remote-rects"; rects: NormRect[] }
+  // クロスタブ: background が「このタブは今 capturer に共有されている(live)」を通知。
+  // live のときだけ自動再検知を走らせ、非共有時の Nano 起動を抑える。
+  | { type: "set-shared-live"; live: boolean }
   | { type: "get-status" };
 
 // --- page(inject) からの通知イベント: inject -> content ---
@@ -96,7 +100,8 @@ export type PageEvent =
   | { type: "publish-rects"; rects: NormRect[]; armed: boolean }
   // AI 自動検知の入力(DOM スナップショット + 任意の縮小フレーム dataURL)
   // dataUrl があるときだけ段階2(画像)を走らせる。null なら段階2はスキップ。
-  | { type: "detect-payload"; snapshot: string; dataUrl: string | null }
+  // id は検知の世代。結果(set-auto-selectors)に同じ id を載せて順序逆転を防ぐ。
+  | { type: "detect-payload"; snapshot: string; dataUrl: string | null; id: number }
   | { type: "warning"; code: string; surface: string; message: string }
   | { type: "error"; where: string; message: string };
 
