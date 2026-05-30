@@ -1,0 +1,13 @@
+# Node
+node_modules/
+.pnpm-store/
+
+# WXT
+.wxt/
+.output/
+*.tsbuildinfo
+web-ext.config.ts
+
+# OS
+.DS_Store
+Thumbs.db

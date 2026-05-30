@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NanoShield</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>NanoShield</h1>
+      <span id="share-state" class="badge badge-idle">未共有</span>
+    </header>
+
+    <p id="warning" class="warning hidden"></p>
+
+    <section class="row">
+      <label class="switch">
+        <input type="checkbox" id="enabled" />
+        <span>マスクを有効化</span>
+      </label>
+    </section>
+
+    <section class="row">
+      <label class="switch">
+        <input type="checkbox" id="force-all" />
+        <span>緊急: フレーム全体をマスク</span>
+      </label>
+    </section>
+
+    <section class="group">
+      <div class="row">
+        <label for="style">マスク方法</label>
+        <select id="style">
+          <option value="blur">ぼかし</option>
+          <option value="black">黒塗り</option>
+        </select>
+      </div>
+      <div class="row" id="blur-row">
+        <label for="blur">ぼかし強度</label>
+        <input type="range" id="blur" min="4" max="40" step="2" />
+        <span id="blur-val" class="mono"></span>
+      </div>
+    </section>
+
+    <section class="group">
+      <div class="row">
+        <label for="selector-input">マスクする要素 (CSSセレクタ)</label>
+      </div>
+      <div class="row">
+        <input
+          type="text"
+          id="selector-input"
+          placeholder=".balance, #email など"
+        />
+        <button id="add-selector">追加</button>
+      </div>
+      <ul id="selector-list" class="list"></ul>
+    </section>
+
+    <section class="group" id="ai-card">
+      <div class="row"><strong>AI 自動検知 (Gemini Nano)</strong></div>
+      <p id="nano-state" class="muted-line">状態を確認中…</p>
+      <div class="row">
+        <label class="switch">
+          <input type="checkbox" id="image-stage" />
+          <span>画像検知(段階2)も使う</span>
+        </label>
+      </div>
+      <div class="row">
+        <button id="enable-nano">モデルを有効化</button>
+        <button id="run-detect">今すぐ検知</button>
+      </div>
+      <p id="detect-result" class="muted-line"></p>
+      <p class="muted-line">Nano が検知した要素:</p>
+      <ul id="auto-selector-list" class="list"></ul>
+    </section>
+
+    <footer>
+      <small>ホットキー: Ctrl+Shift+M (トグル) / Ctrl+Shift+K (全面)</small>
+    </footer>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
