@@ -49,6 +49,13 @@ export default defineContentScript({
     // 段階2(画像)検知のために、稼働中パイプラインの canvas を参照しておく。
     let currentCanvas: HTMLCanvasElement | null = null;
 
+    // AI 自動再検知。手動「今すぐ検知」で arm され、以降は遷移/DOM変化/操作で再検知する。
+    let autoDetectArmed = false;
+    let autoIncludeImage = false;
+    let lastDetectSnapshot = "";
+    let historyPatched = false;
+    let domObserver: MutationObserver | null = null;
+
     // leading + trailing throttle。scroll 中の publish を間引く。
     function throttle(fn: () => void, ms: number): () => void {
       let last = 0;
@@ -66,6 +73,18 @@ export default defineContentScript({
             fn();
           }, wait);
         }
+      };
+    }
+
+    // trailing debounce。連続イベントが落ち着いてから1回だけ実行する。
+    function debounce(fn: () => void, ms: number): () => void {
+      let timer: number | null = null;
+      return () => {
+        if (timer !== null) clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          timer = null;
+          fn();
+        }, ms);
       };
     }
 
@@ -211,9 +230,9 @@ export default defineContentScript({
           updatePublishing();
           break;
         case "run-detection": {
-          const snapshot = collectDomSnapshot();
-          const dataUrl = cmd.includeImage ? sampleFrame() : null;
-          emit({ type: "detect-payload", snapshot, dataUrl });
+          // 手動検知。以降の自動再検知を arm し、今回は強制実行する。
+          armAutoDetect(cmd.includeImage);
+          emitDetect(true);
           break;
         }
         case "set-auto-selectors":
@@ -285,13 +304,67 @@ export default defineContentScript({
       }
     }
 
+    // ---- AI 自動再検知 ----
+    // 検知ペイロードを送る。force でなければ DOM スナップショットが前回と同じなら送らない
+    // （Nano の無駄打ちを防ぐ）。可視時のみ走る前提で呼ぶ。
+    function emitDetect(force: boolean): void {
+      const snapshot = collectDomSnapshot();
+      if (!force && snapshot === lastDetectSnapshot) return;
+      lastDetectSnapshot = snapshot;
+      const dataUrl = autoIncludeImage ? sampleFrame() : null;
+      emit({ type: "detect-payload", snapshot, dataUrl });
+    }
+
+    // 遷移/変化/操作が落ち着いてから、可視なら再検知する。残存リスク: 機密が描画されて
+    // から検知完了までの数秒は未マスク（fail-open の窓）。手動「今すぐ検知」で即時化できる。
+    const runAutoDetect = debounce(() => {
+      if (!autoDetectArmed || document.hidden) return;
+      emitDetect(false);
+    }, 1000);
+
+    // SPA 遷移: pushState/replaceState はイベントを出さないのでパッチして拾う。
+    function patchHistory(): void {
+      if (historyPatched) return;
+      historyPatched = true;
+      const origPush = history.pushState.bind(history);
+      history.pushState = (data, unused, url) => {
+        origPush(data, unused, url);
+        runAutoDetect();
+      };
+      const origReplace = history.replaceState.bind(history);
+      history.replaceState = (data, unused, url) => {
+        origReplace(data, unused, url);
+        runAutoDetect();
+      };
+    }
+
+    function armAutoDetect(includeImage: boolean): void {
+      autoIncludeImage = includeImage;
+      if (autoDetectArmed) return;
+      autoDetectArmed = true;
+      patchHistory();
+      window.addEventListener("popstate", runAutoDetect);
+      window.addEventListener("hashchange", runAutoDetect);
+      window.addEventListener("pageshow", runAutoDetect);
+      // ユーザー操作。機密が「操作後に表示される」ケースに最も効く。
+      window.addEventListener("click", runAutoDetect, { capture: true, passive: true });
+      window.addEventListener("focusin", runAutoDetect, { passive: true });
+      // 大きな DOM 変化。debounce + スナップショット差分で無駄打ちを抑える。
+      if (domObserver === null && document.body) {
+        domObserver = new MutationObserver(runAutoDetect);
+        domObserver.observe(document.body, { childList: true, subtree: true });
+      }
+    }
+
     window.addEventListener("scroll", schedulePublish, {
       capture: true,
       passive: true,
     });
     window.addEventListener("resize", schedulePublish, { passive: true });
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) schedulePublish();
+      if (document.hidden) return;
+      schedulePublish();
+      runAutoDetect();
     });
 
     // ---- パイプライン ----
