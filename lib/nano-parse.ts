@@ -12,6 +12,19 @@ export interface SelectorResponse {
   selectors: string[];
 }
 
+// スナップショット注釈(` role=` ` type=` ` name=` ` aria="` ` data=[` ` text="`)の手前で切る。
+// いずれも「空白 + key=」形なので、子孫結合子(`#a .b`)や属性セレクタ(`input[type="text"]`)は壊さない。
+const ANNOTATION_RE = /\s+(?:role|type|name|aria|data|text)=/;
+
+// 素の汎用タグ/構造セレクタは画面の広範囲を覆い過剰マスクになるので除外する。
+const BROAD_RE =
+  /^(?:\*|:root|html|head|body|main|header|footer|nav|section|article|aside|div|span|p|a|ul|ol|li|table|thead|tbody|tr|td|th|form|label|button|input)$/i;
+
+function cleanSelector(s: string): string {
+  const m = s.match(ANNOTATION_RE);
+  return (m ? s.slice(0, m.index) : s).trim();
+}
+
 // ```json ... ``` や ``` ... ``` のコードフェンスを剥がす。
 function stripCodeFences(text: string): string {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -52,14 +65,15 @@ function extractSelectorArray(parsed: unknown): unknown[] {
   return [];
 }
 
-// 非文字列・空・長すぎを除去し、トリム・重複排除・件数上限を課す。
+// 非文字列・空・長すぎ・広すぎを除去し、注釈を刈り取り、トリム・重複排除・件数上限を課す。
 function sanitizeSelectors(candidates: unknown[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const c of candidates) {
     if (typeof c !== "string") continue;
-    const sel = c.trim();
+    const sel = cleanSelector(c.trim());
     if (!sel || sel.length > MAX_SELECTOR_LEN) continue;
+    if (BROAD_RE.test(sel)) continue; // 素の汎用タグは過剰マスクになるので除外
     if (seen.has(sel)) continue;
     seen.add(sel);
     out.push(sel);
