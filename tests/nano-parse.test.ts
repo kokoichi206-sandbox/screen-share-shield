@@ -67,4 +67,46 @@ describe("parseSelectorResponse", () => {
       parseSelectorResponse(JSON.stringify({ selectors: [long, ".ok"] })),
     ).toEqual([".ok"]);
   });
+
+  it("スナップショット注釈(text=)を刈り取って有効CSSにする", () => {
+    expect(
+      parseSelectorResponse(
+        '{"selectors":["div.ReadOnlyFormField-title text=\\"a@b.com\\""]}',
+      ),
+    ).toEqual(["div.ReadOnlyFormField-title"]);
+  });
+
+  it("role= / data= 注釈も刈り取る", () => {
+    expect(
+      parseSelectorResponse(
+        '{"selectors":["#cardNumber role=textbox", "span.x data=[data-foo] text=\\"y\\""]}',
+      ),
+    ).toEqual(["#cardNumber", "span.x"]);
+  });
+
+  it("子孫結合子(空白)は壊さない", () => {
+    expect(parseSelectorResponse('{"selectors":["#form .secret"]}')).toEqual([
+      "#form .secret",
+    ]);
+  });
+
+  it("属性セレクタは壊さない", () => {
+    expect(
+      parseSelectorResponse('{"selectors":["input[type=\\"text\\"]"]}'),
+    ).toEqual(['input[type="text"]']);
+  });
+
+  it("素の汎用タグ/構造セレクタは過剰マスク防止で除外", () => {
+    expect(
+      parseSelectorResponse(
+        '{"selectors":["div","span","*","body","main","#ok",".keep"]}',
+      ),
+    ).toEqual(["#ok", ".keep"]);
+  });
+
+  it("注釈刈り取り後に素タグだけになる場合も除外", () => {
+    expect(
+      parseSelectorResponse('{"selectors":["div text=\\"x\\""]}'),
+    ).toEqual([]);
+  });
 });

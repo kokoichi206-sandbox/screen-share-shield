@@ -36,9 +36,17 @@ export const SYSTEM_PROMPT =
   "body/main/html のような広すぎるセレクタは絶対に返さないこと。";
 
 export function buildTextPrompt(snapshot: string): string {
-  return `次は共有中ページの要素一覧（1行=1要素、CSSヒント+属性+テキスト断片）です。
-機密情報を含む要素だけを選び、それを指す CSS セレクタを JSON で返してください。
-形式: {"selectors": ["セレクタ1", ...]}（最大50件、確実なものだけ、広すぎるセレクタ禁止）。
+  return `次は共有中ページの要素一覧です。各行は「CSSヒント␣属性␣テキスト断片」の形式で、
+先頭の CSSヒント部分（例: #id や tag.class）だけが CSS セレクタです。
+
+機密情報を含む要素だけを選び、その要素を指す CSS セレクタを JSON で返してください。
+重要なルール:
+- 返すのは各行の先頭の CSS セレクタ部分のみ。role=, type=, name=, aria=, data=, text= などの
+  注釈は絶対に含めない（例: "div.title text=\\"a@b.com\\"" ではなく "div.title" を返す）。
+- body/main/div/span のような広すぎる素のセレクタは返さない。
+- 確実に機密と判断できるものだけ。最大50件。
+
+形式: {"selectors": ["#id", "tag.class", ...]}
 
 要素一覧:
 ${snapshot}`;
