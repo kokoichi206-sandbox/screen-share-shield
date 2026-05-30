@@ -155,7 +155,8 @@ export default defineContentScript({
           (report.text.ran && report.text.error == null) ||
           (report.image.ran && report.image.error == null);
         if (succeeded) {
-          toPage({ type: "set-auto-selectors", selectors: report.selectors });
+          // id を載せて返す。inject は最新の検知に対する結果だけ採用する（順序逆転対策）。
+          toPage({ type: "set-auto-selectors", selectors: report.selectors, id: evt.id });
         }
       } catch (e) {
         // fail-closed: 検知失敗時は inject の autoSelectors を「触らない」。

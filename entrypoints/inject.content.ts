@@ -44,10 +44,19 @@ export default defineContentScript({
       autoSelectors: new Set<string>(), // Nano 自動検知セレクタ（別枠）
       surface: null as string | null,
       remoteRects: [] as NormRect[], // armed な他タブから届いた正規化 rect(集約)
+      sharedLive: false, // background が通知する「今 capturer に共有されている」状態
     };
 
     // 段階2(画像)検知のために、稼働中パイプラインの canvas を参照しておく。
     let currentCanvas: HTMLCanvasElement | null = null;
+
+    // AI 自動再検知。手動「今すぐ検知」で arm され、以降は遷移/DOM変化/操作で再検知する。
+    let autoDetectArmed = false;
+    let autoIncludeImage = false;
+    let lastDetectSnapshot = "";
+    let domObserver: MutationObserver | null = null;
+    let detectSeq = 0; // 検知の世代カウンタ
+    let lastEmittedDetectId = 0; // 最後に emit した検知 id（古い結果を捨てる判定に使う）
 
     // leading + trailing throttle。scroll 中の publish を間引く。
     function throttle(fn: () => void, ms: number): () => void {
@@ -66,6 +75,27 @@ export default defineContentScript({
             fn();
           }, wait);
         }
+      };
+    }
+
+    // trailing debounce（maxWait 付き）。連続イベントが落ち着いてから実行するが、
+    // 鳴り続ける場合でも最初の呼び出しから最大 maxWait で1回は発火する（starvation 防止）。
+    function debounce(
+      fn: () => void,
+      ms: number,
+      maxWait = Infinity,
+    ): () => void {
+      let timer: number | null = null;
+      let firstCallAt = 0;
+      return () => {
+        const now = performance.now();
+        if (timer === null) firstCallAt = now;
+        else clearTimeout(timer);
+        const wait = Math.min(ms, Math.max(0, maxWait - (now - firstCallAt)));
+        timer = window.setTimeout(() => {
+          timer = null;
+          fn();
+        }, wait);
       };
     }
 
@@ -100,10 +130,20 @@ export default defineContentScript({
     // Nano の初回応答を速く保つため小さめに抑える（大きいほど遅い）。
     function collectDomSnapshot(maxChars = 3500): string {
       const metas: ElementMeta[] = [];
-      const all = document.body?.querySelectorAll("*") ?? [];
+      if (!document.body) return "";
+      // TreeWalker で前方から走査し、上限で打ち切る。querySelectorAll('*') と違い
+      // 巨大 DOM でも全要素の NodeList を作らずに済む。
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_ELEMENT,
+      );
       let scanned = 0;
-      for (const el of all) {
-        if (scanned >= 1200 || metas.length >= 120) break;
+      for (
+        let node = walker.nextNode();
+        node && scanned < 1200 && metas.length < 120;
+        node = walker.nextNode()
+      ) {
+        const el = node as Element;
         scanned++;
         const rect = el.getBoundingClientRect();
         if (!isRectInViewport(rect, window.innerWidth, window.innerHeight)) {
@@ -176,6 +216,10 @@ export default defineContentScript({
         state.remoteRects = cmd.rects;
         return;
       }
+      if (cmd.type === "set-shared-live") {
+        state.sharedLive = cmd.live;
+        return;
+      }
 
       switch (cmd.type) {
         case "set-enabled":
@@ -211,12 +255,14 @@ export default defineContentScript({
           updatePublishing();
           break;
         case "run-detection": {
-          const snapshot = collectDomSnapshot();
-          const dataUrl = cmd.includeImage ? sampleFrame() : null;
-          emit({ type: "detect-payload", snapshot, dataUrl });
+          // 手動検知。以降の自動再検知を arm し、今回は強制実行する。
+          armAutoDetect(cmd.includeImage);
+          emitDetect(true);
           break;
         }
         case "set-auto-selectors":
+          // 最新の検知に対する結果だけ採用（順序逆転で古い結果が新ページに乗るのを防ぐ）。
+          if (cmd.id !== lastEmittedDetectId) break;
           state.autoSelectors = new Set(cmd.selectors);
           updatePublishing();
           break;
@@ -285,13 +331,83 @@ export default defineContentScript({
       }
     }
 
+    // ---- AI 自動再検知 ----
+    const LOCATION_EVENT = "nanoshield:locationchange";
+    const HISTORY_PATCH_KEY = Symbol.for("nanoshield.historyPatched");
+
+    // 検知ペイロードを送る。force でなければ DOM スナップショットが前回と同じなら送らない
+    // （Nano の無駄打ちを防ぐ）。id を採番し、結果はこの id と一致するものだけ採用する。
+    function emitDetect(force: boolean): void {
+      const snapshot = collectDomSnapshot();
+      if (!force && snapshot === lastDetectSnapshot) return;
+      lastDetectSnapshot = snapshot;
+      const dataUrl = autoIncludeImage ? sampleFrame() : null;
+      lastEmittedDetectId = ++detectSeq;
+      emit({ type: "detect-payload", snapshot, dataUrl, id: lastEmittedDetectId });
+    }
+
+    // 遷移/変化/操作が落ち着いてから、共有中(自タブ or 被共有)かつ可視のときだけ再検知する。
+    // maxWait で「mutation が鳴り続けると永遠に発火しない(starvation)」を防ぐ。
+    // 残存リスク: 機密が描画されてから検知完了までの数秒は未マスク（fail-open の窓・手動で即時化可）。
+    const runAutoDetect = debounce(
+      () => {
+        if (!autoDetectArmed || document.hidden) return;
+        if (!state.sharing && !state.sharedLive) return; // 共有中のときだけ Nano を起動
+        emitDetect(false);
+      },
+      1000,
+      4000,
+    );
+
+    // SPA 遷移: pushState/replaceState はイベントを出さないので一度だけパッチし、
+    // 全インスタンスが拾える custom event を発火する（Symbol.for で page-global に二重パッチ防止）。
+    function patchHistory(): void {
+      const h = history as History & { [HISTORY_PATCH_KEY]?: true };
+      if (h[HISTORY_PATCH_KEY]) return;
+      Object.defineProperty(h, HISTORY_PATCH_KEY, { value: true });
+      const fire = () => window.dispatchEvent(new Event(LOCATION_EVENT));
+      const origPush = h.pushState;
+      h.pushState = function (this: History, data, unused, url) {
+        const ret = origPush.call(this, data, unused, url);
+        fire();
+        return ret;
+      };
+      const origReplace = h.replaceState;
+      h.replaceState = function (this: History, data, unused, url) {
+        const ret = origReplace.call(this, data, unused, url);
+        fire();
+        return ret;
+      };
+    }
+
+    function armAutoDetect(includeImage: boolean): void {
+      autoIncludeImage = includeImage;
+      if (autoDetectArmed) return;
+      autoDetectArmed = true;
+      patchHistory();
+      window.addEventListener(LOCATION_EVENT, runAutoDetect);
+      window.addEventListener("popstate", runAutoDetect);
+      window.addEventListener("hashchange", runAutoDetect);
+      window.addEventListener("pageshow", runAutoDetect);
+      // ユーザー操作。機密が「操作後に表示される」ケースに最も効く。
+      window.addEventListener("click", runAutoDetect, { capture: true, passive: true });
+      window.addEventListener("focusin", runAutoDetect, { passive: true });
+      // 大きな DOM 変化。debounce(+maxWait) + スナップショット差分 + live ゲートで無駄打ちを抑える。
+      if (domObserver === null && document.body) {
+        domObserver = new MutationObserver(runAutoDetect);
+        domObserver.observe(document.body, { childList: true, subtree: true });
+      }
+    }
+
     window.addEventListener("scroll", schedulePublish, {
       capture: true,
       passive: true,
     });
     window.addEventListener("resize", schedulePublish, { passive: true });
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) schedulePublish();
+      if (document.hidden) return;
+      schedulePublish();
+      runAutoDetect();
     });
 
     // ---- パイプライン ----

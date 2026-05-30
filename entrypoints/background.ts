@@ -37,6 +37,7 @@ interface TabRectsEntry {
 const tabRects = new Map<number, TabRectsEntry>();
 const capturers = new Set<number>();
 const lastPushed = new Map<number, string>(); // capturerTabId -> 直前に配った rects の JSON
+const liveSources = new Map<number, boolean>(); // sourceTabId -> 直前に通知した live 状態
 
 export default defineBackground(() => {
   // --- ホットキー転送 ---
@@ -52,12 +53,14 @@ export default defineBackground(() => {
     void browser.tabs.sendMessage(tab.id, message).catch(() => {});
   });
 
-  // タブが閉じたらレジストリから除去し、残る capturer を更新。
+  // タブが閉じたらレジストリから除去し、残る capturer / live source を更新。
   browser.tabs.onRemoved.addListener((tabId) => {
     tabRects.delete(tabId);
     capturers.delete(tabId);
     lastPushed.delete(tabId);
+    liveSources.delete(tabId);
     for (const capturerTabId of capturers) pushRemoteRects(capturerTabId);
+    updateLiveSources();
   });
 
   // --- runtime メッセージ ---
@@ -100,6 +103,7 @@ export default defineBackground(() => {
         tabRects.set(tabId, { rects: message.rects, armed: message.armed });
         // ソースが更新されたので全 capturer を再評価して配り直す。
         for (const capturerTabId of capturers) pushRemoteRects(capturerTabId);
+        updateLiveSources();
         return;
       }
       case "subscribe-rects": {
@@ -107,6 +111,7 @@ export default defineBackground(() => {
         if (tabId == null) return;
         capturers.add(tabId);
         pushRemoteRects(tabId);
+        updateLiveSources();
         return;
       }
       case "unsubscribe-rects": {
@@ -115,6 +120,7 @@ export default defineBackground(() => {
           capturers.delete(tabId);
           lastPushed.delete(tabId);
         }
+        updateLiveSources();
         return;
       }
 
@@ -148,6 +154,28 @@ function pushRemoteRects(capturerTabId: number): void {
     cmd: { type: "set-remote-rects", rects },
   };
   void browser.tabs.sendMessage(capturerTabId, message).catch(() => {});
+}
+
+// 各 armed source タブに「今 capturer に共有されているか(live)」を通知する。
+// live のときだけ source 側で自動再検知が走る（非共有時の Nano 起動を抑える）。
+// source T が live = T が armed かつ T 以外の capturer が存在する（全 armed を全 capturer に配るため）。
+function updateLiveSources(): void {
+  const hasOtherCapturer = (tabId: number): boolean => {
+    for (const c of capturers) if (c !== tabId) return true;
+    return false;
+  };
+  const relevant = new Set<number>([...tabRects.keys(), ...liveSources.keys()]);
+  for (const tabId of relevant) {
+    const live = !!tabRects.get(tabId)?.armed && hasOtherCapturer(tabId);
+    if (liveSources.get(tabId) === live) continue;
+    liveSources.set(tabId, live);
+    const message: RuntimeMessage = {
+      channel: CHANNEL,
+      kind: "command",
+      cmd: { type: "set-shared-live", live },
+    };
+    void browser.tabs.sendMessage(tabId, message).catch(() => {});
+  }
 }
 
 // Promise の結果を sendResponse へ。reject 時は必ず fallback を返してチャネルを閉じない。
