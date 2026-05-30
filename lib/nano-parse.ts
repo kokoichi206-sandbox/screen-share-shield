@@ -20,6 +20,10 @@ const ANNOTATION_RE = /\s+(?:role|type|name|aria|data|text)=/;
 const BROAD_RE =
   /^(?:\*|:root|html|head|body|main|header|footer|nav|section|article|aside|div|span|p|a|ul|ol|li|table|thead|tbody|tr|td|th|form|label|button|input)$/i;
 
+// SPA のアプリ全体コンテナ id。これらは大抵ページ全体を覆うので除外する
+// （実行時の面積ゲートでも弾くが、popup の一覧にも出さないよう parse でも落とす）。
+const BROAD_ID_RE = /^#(?:root|app|__next|__nuxt|gatsby-focus-wrapper|svelte)$/i;
+
 function cleanSelector(s: string): string {
   const m = s.match(ANNOTATION_RE);
   return (m ? s.slice(0, m.index) : s).trim();
@@ -73,7 +77,7 @@ function sanitizeSelectors(candidates: unknown[]): string[] {
     if (typeof c !== "string") continue;
     const sel = cleanSelector(c.trim());
     if (!sel || sel.length > MAX_SELECTOR_LEN) continue;
-    if (BROAD_RE.test(sel)) continue; // 素の汎用タグは過剰マスクになるので除外
+    if (BROAD_RE.test(sel) || BROAD_ID_RE.test(sel)) continue; // 過剰マスクになるので除外
     if (seen.has(sel)) continue;
     seen.add(sel);
     out.push(sel);
