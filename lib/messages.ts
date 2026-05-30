@@ -3,7 +3,7 @@
 
 import type { NormRect } from "@/lib/masking";
 
-export const CHANNEL = "nanoshield" as const;
+export const CHANNEL = "screen-share-shield" as const;
 
 export type MaskStyle = "blur" | "black";
 

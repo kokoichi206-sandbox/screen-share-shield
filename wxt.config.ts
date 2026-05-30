@@ -3,7 +3,7 @@ import { defineConfig } from "wxt";
 // WXT 設定。manifest はここから生成され、content scripts は entrypoints/ から自動登録される。
 export default defineConfig({
   manifest: {
-    name: "NanoShield - AI Screen Mask",
+    name: "Screen Share Shield",
     description:
       "画面共有中だけ、相手の映像に映る機密情報をマスクするプライバシーガード（自分の画面はそのまま）。",
     permissions: ["storage", "tabs", "activeTab"],
