@@ -3,6 +3,7 @@ import {
   clampRectToCanvas,
   fromNormalizedRect,
   isRectInViewport,
+  isRectTooBroad,
   scaleViewportRect,
   toNormalizedRect,
   type ViewportRect,
@@ -16,6 +17,36 @@ function vr(
 ): ViewportRect {
   return { left, top, width, height, right: left + width, bottom: top + height };
 }
+
+describe("isRectTooBroad", () => {
+  const VW = 1000;
+  const VH = 800;
+
+  it("ビューポート全体を覆う要素(#root 相当)は too broad", () => {
+    expect(isRectTooBroad(vr(0, 0, 1000, 800), VW, VH)).toBe(true);
+  });
+
+  it("ビューポートを超える要素も可視面積で判定して too broad", () => {
+    expect(isRectTooBroad(vr(-50, -50, 1200, 1000), VW, VH)).toBe(true);
+  });
+
+  it("小さな機密フィールドは too broad ではない", () => {
+    expect(isRectTooBroad(vr(100, 100, 200, 40), VW, VH)).toBe(false);
+  });
+
+  it("片側カラムのフォーム(45%×70%)は too broad ではない", () => {
+    expect(isRectTooBroad(vr(500, 50, 450, 560), VW, VH)).toBe(false);
+  });
+
+  it("閾値ちょうど(80%面積)は too broad", () => {
+    // 800x800 = 640000 = 0.8 * 1000*800
+    expect(isRectTooBroad(vr(0, 0, 800, 800), VW, VH)).toBe(true);
+  });
+
+  it("ビューポート 0 は false", () => {
+    expect(isRectTooBroad(vr(0, 0, 100, 100), 0, VH)).toBe(false);
+  });
+});
 
 describe("isRectInViewport", () => {
   const VW = 1000;

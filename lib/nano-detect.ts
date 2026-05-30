@@ -44,6 +44,8 @@ export function buildTextPrompt(snapshot: string): string {
 - 返すのは各行の先頭の CSS セレクタ部分のみ。role=, type=, name=, aria=, data=, text= などの
   注釈は絶対に含めない（例: "div.title text=\\"a@b.com\\"" ではなく "div.title" を返す）。
 - body/main/div/span のような広すぎる素のセレクタは返さない。
+- ページ全体を覆うコンテナ（#root, #app, #__next, ラッパー要素など）は返さない。機密を含む
+  「個々の入力欄やテキスト要素」をできるだけ絞って指す（カード番号欄、メール欄、金額表示など）。
 - 確実に機密と判断できるものだけ。最大50件。
 
 形式: {"selectors": ["#id", "tag.class", ...]}

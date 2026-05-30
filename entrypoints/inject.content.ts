@@ -10,10 +10,12 @@ import {
   clampRectToCanvas,
   fromNormalizedRect,
   isRectInViewport,
+  isRectTooBroad,
   scaleViewportRect,
   toNormalizedRect,
   type NormRect,
   type Rect,
+  type ViewportRect,
 } from "@/lib/masking";
 import { buildSnapshot, type ElementMeta } from "@/lib/dom-snapshot";
 import { computeDownscaleSize } from "@/lib/image";
@@ -277,23 +279,39 @@ export default defineContentScript({
     }
 
     // ---- クロスタブ: このタブ(共有される側)の機密 rect を publish する ----
-    function computeNormalizedRects(): NormRect[] {
+    // 手動 + 自動セレクタにマッチする、ビューポート内の要素 rect を集める。
+    // 自動検知(Nano)のセレクタは「ビューポートの大半を覆う＝過剰選択」を弾く（#root 等の全面マスク防止）。
+    // 手動セレクタはユーザーの意図を尊重して弾かない。
+    function collectTargetRects(): ViewportRect[] {
       const vw = window.innerWidth;
       const vh = window.innerHeight;
-      const out: NormRect[] = [];
-      for (const sel of new Set([...state.selectors, ...state.autoSelectors])) {
+      const out: ViewportRect[] = [];
+      const collect = (sel: string, gateBroad: boolean) => {
         let els: NodeListOf<Element>;
         try {
           els = document.querySelectorAll(sel);
         } catch {
-          continue;
+          return; // 不正なセレクタはスキップ
         }
         for (const el of els) {
           const r = el.getBoundingClientRect();
           if (!isRectInViewport(r, vw, vh)) continue;
-          const n = toNormalizedRect(r, vw, vh);
-          if (n) out.push(n);
+          if (gateBroad && isRectTooBroad(r, vw, vh)) continue;
+          out.push(r);
         }
+      };
+      for (const sel of state.selectors) collect(sel, false);
+      for (const sel of state.autoSelectors) collect(sel, true);
+      return out;
+    }
+
+    function computeNormalizedRects(): NormRect[] {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const out: NormRect[] = [];
+      for (const r of collectTargetRects()) {
+        const n = toNormalizedRect(r, vw, vh);
+        if (n) out.push(n);
       }
       return out;
     }
@@ -459,23 +477,11 @@ export default defineContentScript({
         if (state.surface !== "browser") return [];
         const rects: Rect[] = [];
 
-        // (A) ローカル DOM: このタブ自身の機密要素（手動 + 自動）。
+        // (A) ローカル DOM: このタブ自身の機密要素（手動 + 自動・過剰選択はゲート済み）。
         const scaleX = canvas.width / window.innerWidth;
         const scaleY = canvas.height / window.innerHeight;
-        for (const sel of new Set([...state.selectors, ...state.autoSelectors])) {
-          let els: NodeListOf<Element>;
-          try {
-            els = document.querySelectorAll(sel);
-          } catch {
-            continue; // 不正なセレクタはスキップ
-          }
-          for (const el of els) {
-            const r = el.getBoundingClientRect();
-            if (!isRectInViewport(r, window.innerWidth, window.innerHeight)) {
-              continue;
-            }
-            rects.push(scaleViewportRect(r, scaleX, scaleY));
-          }
+        for (const r of collectTargetRects()) {
+          rects.push(scaleViewportRect(r, scaleX, scaleY));
         }
 
         // (B) リモート: armed な他タブから届いた正規化 rect。

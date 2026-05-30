@@ -104,6 +104,14 @@ describe("parseSelectorResponse", () => {
     ).toEqual(["#ok", ".keep"]);
   });
 
+  it("SPA のアプリ全体コンテナ id(#root 等)は除外", () => {
+    expect(
+      parseSelectorResponse(
+        '{"selectors":["#root","#app","#__next","#__nuxt","#cardNumber"]}',
+      ),
+    ).toEqual(["#cardNumber"]);
+  });
+
   it("注釈刈り取り後に素タグだけになる場合も除外", () => {
     expect(
       parseSelectorResponse('{"selectors":["div text=\\"x\\""]}'),

@@ -98,3 +98,19 @@ export function fromNormalizedRect(
 ): Rect {
   return { x: n.x * canvasW, y: n.y * canvasH, w: n.w * canvasW, h: n.h * canvasH };
 }
+
+// ビューポートの大半を覆う rect（#root 等のページ全体コンテナ）を「広すぎる」と判定する。
+// 機密フィールドは画面の一部なので、可視部分の面積が viewport 面積の maxAreaRatio 以上なら true。
+// AI 検知が誤ってページ全体を選んでも、これで全面マスク化を防ぐ。
+export function isRectTooBroad(
+  r: ViewportRect,
+  viewportW: number,
+  viewportH: number,
+  maxAreaRatio = 0.8,
+): boolean {
+  if (viewportW <= 0 || viewportH <= 0) return false;
+  const w = Math.min(r.right, viewportW) - Math.max(r.left, 0);
+  const h = Math.min(r.bottom, viewportH) - Math.max(r.top, 0);
+  if (w <= 0 || h <= 0) return false;
+  return w * h >= maxAreaRatio * viewportW * viewportH;
+}
