@@ -25,6 +25,35 @@ export default defineContentScript({
     let lastStatus: ShareStatus | null = null;
     // background が返した直近の Nano 検知結果（popup 表示用）
     let lastNanoReport: NanoReport | null = null;
+    let subscribeTick: number | null = null;
+
+    // 拡張リロード等で context が無効化された「孤児 content script」対策。
+    // context 無効時 browser.runtime.sendMessage は同期 throw するため .catch では拾えない。
+    function contextValid(): boolean {
+      try {
+        return browser.runtime?.id != null;
+      } catch {
+        return false;
+      }
+    }
+    function teardownOrphan(): void {
+      if (subscribeTick !== null) {
+        clearInterval(subscribeTick);
+        subscribeTick = null;
+      }
+    }
+    // fire-and-forget の runtime 送信。context 無効なら静かに諦めてタイマーも止める。
+    function safeSend(message: object): void {
+      if (!contextValid()) {
+        teardownOrphan();
+        return;
+      }
+      try {
+        void browser.runtime.sendMessage(message).catch(() => {});
+      } catch {
+        teardownOrphan();
+      }
+    }
 
     // --- inject(MAIN) -> bridge ---
     window.addEventListener("message", (e: MessageEvent) => {
@@ -48,14 +77,12 @@ export default defineContentScript({
           break;
         case "publish-rects":
           // このタブ(共有される側)の rect を background へ。popup には流さない。
-          void browser.runtime
-            .sendMessage({
-              channel: CHANNEL,
-              kind: "publish-rects",
-              rects: evt.rects,
-              armed: evt.armed,
-            })
-            .catch(() => {});
+          safeSend({
+            channel: CHANNEL,
+            kind: "publish-rects",
+            rects: evt.rects,
+            armed: evt.armed,
+          });
           return;
         case "detect-payload":
           // 大きい dataURL を含むので popup には転送せず、ここで background に渡す。
@@ -64,7 +91,7 @@ export default defineContentScript({
       }
 
       // popup が開いていれば届く。閉じていれば receiver なしで reject するので握りつぶす。
-      void browser.runtime.sendMessage({ channel: CHANNEL, evt }).catch(() => {});
+      safeSend({ channel: CHANNEL, evt });
     });
 
     // --- 拡張側(popup/background) -> bridge -> inject ---
@@ -98,24 +125,15 @@ export default defineContentScript({
     // クロスタブ: 共有中は subscribe を定期的に送り直す。MV3 の Service Worker が
     // アイドルで揮発すると capturers レジストリが消えるため、1回きりの subscribe では
     // 復帰後に rect 配信が止まる。定期再送で購読を維持する。
-    let subscribeTick: number | null = null;
     function startRectSubscription(): void {
       stopRectSubscription();
-      const send = () =>
-        void browser.runtime
-          .sendMessage({ channel: CHANNEL, kind: "subscribe-rects" })
-          .catch(() => {});
+      const send = () => safeSend({ channel: CHANNEL, kind: "subscribe-rects" });
       send();
       subscribeTick = window.setInterval(send, 1000);
     }
     function stopRectSubscription(): void {
-      if (subscribeTick !== null) {
-        clearInterval(subscribeTick);
-        subscribeTick = null;
-      }
-      void browser.runtime
-        .sendMessage({ channel: CHANNEL, kind: "unsubscribe-rects" })
-        .catch(() => {});
+      teardownOrphan();
+      safeSend({ channel: CHANNEL, kind: "unsubscribe-rects" });
     }
 
     // 段階1/2 のペイロードを background(Nano) に渡し、結果を inject へ反映する。
