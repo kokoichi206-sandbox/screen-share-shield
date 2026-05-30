@@ -350,8 +350,8 @@ export default defineContentScript({
     }
 
     // ---- AI 自動再検知 ----
-    const LOCATION_EVENT = "nanoshield:locationchange";
-    const HISTORY_PATCH_KEY = Symbol.for("nanoshield.historyPatched");
+    const LOCATION_EVENT = "screen-share-shield:locationchange";
+    const HISTORY_PATCH_KEY = Symbol.for("screen-share-shield.historyPatched");
 
     // 検知ペイロードを送る。force でなければ DOM スナップショットが前回と同じなら送らない
     // （Nano の無駄打ちを防ぐ）。id を採番し、結果はこの id と一致するものだけ採用する。
