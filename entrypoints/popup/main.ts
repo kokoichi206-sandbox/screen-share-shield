@@ -34,7 +34,6 @@ const els = {
   selectorInput: byId<HTMLInputElement>("selector-input"),
   addSelector: byId<HTMLButtonElement>("add-selector"),
   selectorList: byId<HTMLUListElement>("selector-list"),
-  autoDetect: byId<HTMLInputElement>("auto-detect"),
   imageStage: byId<HTMLInputElement>("image-stage"),
   enableNano: byId<HTMLButtonElement>("enable-nano"),
   runDetect: byId<HTMLButtonElement>("run-detect"),
@@ -89,7 +88,6 @@ function render(): void {
   els.blur.value = String(settings.blurPx);
   els.blurVal.textContent = `${settings.blurPx}px`;
   els.blurRow.classList.toggle("hidden", settings.style !== "blur");
-  els.autoDetect.checked = settings.autoDetectOnShare;
   els.imageStage.checked = settings.imageStage;
   renderSelectors();
 }
@@ -219,10 +217,6 @@ els.selectorInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") void addSelectorFromInput();
 });
 
-els.autoDetect.addEventListener("change", () => {
-  settings.autoDetectOnShare = els.autoDetect.checked;
-  void saveSettings();
-});
 els.imageStage.addEventListener("change", () => {
   settings.imageStage = els.imageStage.checked;
   void saveSettings();

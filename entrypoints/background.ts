@@ -8,7 +8,6 @@ import {
   type RuntimeMessage,
 } from "@/lib/messages";
 import type { NormRect } from "@/lib/masking";
-import { pickSourceTab, type SourceEntry } from "@/lib/match-source";
 import {
   getAvailability,
   runDetection,
@@ -18,7 +17,8 @@ import {
 // service worker。3つの役割:
 //  1) ホットキー(commands)をアクティブタブの bridge へ転送。
 //  2) Gemini Nano(LanguageModel)の実行。拡張 SW は origin trial 不要で self.LanguageModel が使える。
-//  3) クロスタブ協調: 各タブが publish する正規化 rect を集約し、共有元(capturer)へ対応ソースの rect を配る。
+//  3) クロスタブ協調: 各タブが publish する正規化 rect を集約し、共有元(capturer)へ
+//     「armed な全タブの rect」を配る。capturer は ローカル∪リモート を当てる(fail-closed)。
 //
 // 注意: WXT の `browser` はネイティブ chrome そのもの(polyfill 無し)。
 // ネイティブ Chrome の onMessage は Promise 返却での非同期応答に非対応なので、
@@ -32,14 +32,11 @@ const COMMAND_TO_PAGE: Record<string, PageCommand> = {
 // --- クロスタブ rect レジストリ（SW 内メモリ。揮発しても各タブが再 publish するので回復する）---
 interface TabRectsEntry {
   rects: NormRect[];
-  aspect: number;
   armed: boolean;
-  ts: number;
 }
 const tabRects = new Map<number, TabRectsEntry>();
-const capturers = new Map<number, { captureAspect: number | null }>();
+const capturers = new Set<number>();
 const lastPushed = new Map<number, string>(); // capturerTabId -> 直前に配った rects の JSON
-let seq = 0; // 単調増加の擬似タイムスタンプ（最新判定用）
 
 export default defineBackground(() => {
   // --- ホットキー転送 ---
@@ -56,12 +53,11 @@ export default defineBackground(() => {
   });
 
   // タブが閉じたらレジストリから除去し、残る capturer を更新。
-  // 閉じたタブは source でも capturer でもなくなるので両 Map から消すのが正しい。
   browser.tabs.onRemoved.addListener((tabId) => {
     tabRects.delete(tabId);
     capturers.delete(tabId);
     lastPushed.delete(tabId);
-    for (const capturerTabId of capturers.keys()) pushRemoteRects(capturerTabId);
+    for (const capturerTabId of capturers) pushRemoteRects(capturerTabId);
   });
 
   // --- runtime メッセージ ---
@@ -101,20 +97,15 @@ export default defineBackground(() => {
       case "publish-rects": {
         const tabId = sender.tab?.id;
         if (tabId == null) return;
-        tabRects.set(tabId, {
-          rects: message.rects,
-          aspect: message.aspect,
-          armed: message.armed,
-          ts: ++seq,
-        });
+        tabRects.set(tabId, { rects: message.rects, armed: message.armed });
         // ソースが更新されたので全 capturer を再評価して配り直す。
-        for (const capturerTabId of capturers.keys()) pushRemoteRects(capturerTabId);
+        for (const capturerTabId of capturers) pushRemoteRects(capturerTabId);
         return;
       }
       case "subscribe-rects": {
         const tabId = sender.tab?.id;
         if (tabId == null) return;
-        capturers.set(tabId, { captureAspect: message.captureAspect });
+        capturers.add(tabId);
         pushRemoteRects(tabId);
         return;
       }
@@ -134,31 +125,27 @@ export default defineBackground(() => {
   });
 });
 
-// capturer がキャプチャしている surface に対応するソースタブの rect を配る。
+// capturer へ「armed な全タブ(自分以外)の rect を集約したもの」を配る。
+// どのタブを映しているか特定できないため、1つに賭けず全 armed タブ分を当てる(fail-closed)。
+// 単一の armed タブ運用なら過不足なし。複数 armed なら過剰マスク(安全側)になる。
 function pushRemoteRects(capturerTabId: number): void {
-  const capturer = capturers.get(capturerTabId);
-  if (!capturer) return;
+  if (!capturers.has(capturerTabId)) return;
 
-  const entries: SourceEntry[] = [...tabRects.entries()].map(([tabId, e]) => ({
-    tabId,
-    armed: e.armed,
-    aspect: e.aspect,
-    ts: e.ts,
-  }));
-  const sourceTabId = pickSourceTab(entries, capturerTabId, capturer.captureAspect);
-  // リモートソースが見つかった = 別タブ共有。capturer はローカル DOM マスクを使わず remote のみ。
-  const crossTab = sourceTabId != null;
-  const rects = sourceTabId != null ? (tabRects.get(sourceTabId)?.rects ?? []) : [];
+  const rects: NormRect[] = [];
+  for (const [tabId, entry] of tabRects) {
+    if (tabId === capturerTabId || !entry.armed) continue;
+    rects.push(...entry.rects);
+  }
 
   // この capturer に前回配った内容と同じなら送らない（無駄な再送を抑制）。
-  const key = JSON.stringify({ crossTab, rects });
-  if (lastPushed.get(capturerTabId) === key) return;
-  lastPushed.set(capturerTabId, key);
+  const json = JSON.stringify(rects);
+  if (lastPushed.get(capturerTabId) === json) return;
+  lastPushed.set(capturerTabId, json);
 
   const message: RuntimeMessage = {
     channel: CHANNEL,
     kind: "command",
-    cmd: { type: "set-remote-rects", rects, crossTab },
+    cmd: { type: "set-remote-rects", rects },
   };
   void browser.tabs.sendMessage(capturerTabId, message).catch(() => {});
 }

@@ -43,10 +43,7 @@ export default defineContentScript({
       selectors: new Set<string>(), // 手動セレクタ
       autoSelectors: new Set<string>(), // Nano 自動検知セレクタ（別枠）
       surface: null as string | null,
-      videoW: 0, // キャプチャ映像の寸法（ソースタブ対応付け用）
-      videoH: 0,
-      remoteRects: [] as NormRect[], // 別タブ共有時、共有される側から届いた正規化 rect
-      crossTab: false, // 別タブ共有か（true ならローカル DOM マスクは使わず remote のみ）
+      remoteRects: [] as NormRect[], // armed な他タブから届いた正規化 rect(集約)
     };
 
     // 段階2(画像)検知のために、稼働中パイプラインの canvas を参照しておく。
@@ -177,7 +174,6 @@ export default defineContentScript({
       // 高頻度コマンドは status を撒かない（早期 return）。
       if (cmd.type === "set-remote-rects") {
         state.remoteRects = cmd.rects;
-        state.crossTab = cmd.crossTab;
         return;
       }
 
@@ -268,12 +264,7 @@ export default defineContentScript({
       const json = JSON.stringify({ armed, rects });
       if (json === lastPublishedJson) return; // 変化が無ければ送らない
       lastPublishedJson = json;
-      emit({
-        type: "publish-rects",
-        rects,
-        aspect: window.innerWidth / Math.max(1, window.innerHeight),
-        armed,
-      });
+      emit({ type: "publish-rects", rects, armed });
     }
 
     const schedulePublish = throttle(publishRects, 120);
@@ -316,8 +307,6 @@ export default defineContentScript({
       if (!videoTrack) throw new Error("video track が見つかりません");
       const settings = videoTrack.getSettings();
       state.surface = settings.displaySurface ?? "unknown";
-      state.videoW = settings.width ?? 0;
-      state.videoH = settings.height ?? 0;
 
       const video = document.createElement("video");
       video.srcObject = new MediaStream([videoTrack]);
@@ -347,22 +336,14 @@ export default defineContentScript({
 
       // 表示中の要素のマスク矩形(canvas ピクセル系)。
       // タブ共有時のみ、ビューポート/正規化座標 -> 映像ピクセルへマッピングできる。
+      // fail-closed: ローカル DOM(自タブの機密) ∪ リモート(armed な他タブの rect) を常に適用する。
+      //  - 自タブ共有: ローカルがこのタブ自身の機密を覆う。リモートは他に armed タブがあれば過剰側に乗るだけ。
+      //  - 別タブ共有: リモートが共有される側の機密を覆う。ローカルはこのタブ(capturer)に機密が無ければ空。
       function maskRects(): Rect[] {
         if (state.surface !== "browser") return [];
-
-        // 別タブ共有: 共有される側から届いた rect のみ。
-        // このタブ(capturer)のローカル DOM は共有内容と無関係なので使わない
-        // （使うと capturer 自身の要素を別タブの映像に重ねて誤マスクする）。
-        if (state.crossTab) {
-          const rects: Rect[] = [];
-          for (const n of state.remoteRects) {
-            rects.push(fromNormalizedRect(n, canvas.width, canvas.height));
-          }
-          return rects;
-        }
-
-        // 自タブ共有: このタブ自身の機密要素（手動 + 自動）をローカル DOM から。
         const rects: Rect[] = [];
+
+        // (A) ローカル DOM: このタブ自身の機密要素（手動 + 自動）。
         const scaleX = canvas.width / window.innerWidth;
         const scaleY = canvas.height / window.innerHeight;
         for (const sel of new Set([...state.selectors, ...state.autoSelectors])) {
@@ -379,6 +360,11 @@ export default defineContentScript({
             }
             rects.push(scaleViewportRect(r, scaleX, scaleY));
           }
+        }
+
+        // (B) リモート: armed な他タブから届いた正規化 rect。
+        for (const n of state.remoteRects) {
+          rects.push(fromNormalizedRect(n, canvas.width, canvas.height));
         }
         return rects;
       }
@@ -438,6 +424,9 @@ export default defineContentScript({
         }
         if (rafHandle !== null) cancelAnimationFrame(rafHandle);
         for (const t of outStream.getVideoTracks()) t.stop();
+        // 元のキャプチャ stream も停止する。パイプライン差し替え時に古い capture
+        // セッション/音声トラックが生き残るのを防ぐ。
+        for (const t of srcStream.getTracks()) t.stop();
         video.srcObject = null;
         if (currentCanvas === canvas) currentCanvas = null;
       }
@@ -446,7 +435,6 @@ export default defineContentScript({
       videoTrack.addEventListener("ended", () => {
         state.sharing = false;
         state.remoteRects = []; // 共有終了でリモートマスクを破棄
-        state.crossTab = false;
         stop();
         emit({ type: "share-ended" });
         emitStatus();
@@ -484,12 +472,7 @@ export default defineContentScript({
           pipeline = startPipeline(srcStream);
           await pipeline.started; // play 失敗ならここで throw
           state.sharing = true;
-          emit({
-            type: "share-started",
-            surface: state.surface ?? "unknown",
-            videoW: state.videoW,
-            videoH: state.videoH,
-          });
+          emit({ type: "share-started", surface: state.surface ?? "unknown" });
           emitStatus();
           if (state.surface !== "browser") {
             emit({

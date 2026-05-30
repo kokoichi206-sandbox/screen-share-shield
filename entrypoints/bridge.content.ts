@@ -40,20 +40,11 @@ export default defineContentScript({
           void pushSavedSettings();
           break;
         case "share-started":
-          void maybeAutoDetect();
-          // クロスタブ: タブ共有なら、共有される側の rect を background に要求する。
-          if (evt.surface === "browser") {
-            const captureAspect =
-              evt.videoW > 0 && evt.videoH > 0 ? evt.videoW / evt.videoH : null;
-            void browser.runtime
-              .sendMessage({ channel: CHANNEL, kind: "subscribe-rects", captureAspect })
-              .catch(() => {});
-          }
+          // クロスタブ: タブ共有なら、armed な全タブの rect を background に要求する。
+          if (evt.surface === "browser") startRectSubscription();
           break;
         case "share-ended":
-          void browser.runtime
-            .sendMessage({ channel: CHANNEL, kind: "unsubscribe-rects" })
-            .catch(() => {});
+          stopRectSubscription();
           break;
         case "publish-rects":
           // このタブ(共有される側)の rect を background へ。popup には流さない。
@@ -62,7 +53,6 @@ export default defineContentScript({
               channel: CHANNEL,
               kind: "publish-rects",
               rects: evt.rects,
-              aspect: evt.aspect,
               armed: evt.armed,
             })
             .catch(() => {});
@@ -105,6 +95,29 @@ export default defineContentScript({
       window.postMessage(msg, "*");
     }
 
+    // クロスタブ: 共有中は subscribe を定期的に送り直す。MV3 の Service Worker が
+    // アイドルで揮発すると capturers レジストリが消えるため、1回きりの subscribe では
+    // 復帰後に rect 配信が止まる。定期再送で購読を維持する。
+    let subscribeTick: number | null = null;
+    function startRectSubscription(): void {
+      stopRectSubscription();
+      const send = () =>
+        void browser.runtime
+          .sendMessage({ channel: CHANNEL, kind: "subscribe-rects" })
+          .catch(() => {});
+      send();
+      subscribeTick = window.setInterval(send, 1000);
+    }
+    function stopRectSubscription(): void {
+      if (subscribeTick !== null) {
+        clearInterval(subscribeTick);
+        subscribeTick = null;
+      }
+      void browser.runtime
+        .sendMessage({ channel: CHANNEL, kind: "unsubscribe-rects" })
+        .catch(() => {});
+    }
+
     // 段階1/2 のペイロードを background(Nano) に渡し、結果を inject へ反映する。
     async function handleDetectPayload(
       evt: Extract<PageEvent, { type: "detect-payload" }>,
@@ -118,8 +131,14 @@ export default defineContentScript({
         })) as DetectResponse | undefined;
         if (!report) return;
         lastNanoReport = report;
-        // 検知成功時のみ自動枠を更新（0件なら空に）。手動 selectors は触らない。
-        toPage({ type: "set-auto-selectors", selectors: report.selectors });
+        // fail-closed: いずれかの段階が「実行され、かつエラー無し」のときだけ自動枠を更新する。
+        // 検知が成功して 0 件 → 空に更新(正当)。利用不可/prompt失敗 → 既存マスクを維持(外さない)。
+        const succeeded =
+          (report.text.ran && report.text.error == null) ||
+          (report.image.ran && report.image.error == null);
+        if (succeeded) {
+          toPage({ type: "set-auto-selectors", selectors: report.selectors });
+        }
       } catch (e) {
         // fail-closed: 検知失敗時は inject の autoSelectors を「触らない」。
         // ここで空に同期すると共有中の既存マスクを外してしまう(=fail-open)ため。
@@ -130,15 +149,6 @@ export default defineContentScript({
           image: { ran: false, availability: "skipped", count: 0, error: null },
           error: String(e),
         };
-      }
-    }
-
-    async function maybeAutoDetect(): Promise<void> {
-      const { settings } = await browser.storage.local.get("settings");
-      const s = settings as Settings | undefined;
-      if (s?.autoDetectOnShare) {
-        lastNanoReport = null;
-        toPage({ type: "run-detection", includeImage: s.imageStage !== false });
       }
     }
 

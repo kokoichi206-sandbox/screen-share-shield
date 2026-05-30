@@ -40,7 +40,7 @@ getDisplayMedia()
 拡張 service worker は origin trial 不要で利用できる唯一のコンテキストなので、Nano は background に集約する。
 
 ```
-popup「今すぐ検知」/ 共有開始時(任意)
+popup「今すぐ検知」
   └─ run-detection ─▶ inject: DOM スナップショット + (任意で)縮小フレームdataURL を収集
         └─ detect-payload ─▶ bridge ─ runtime ─▶ background
               段階1: DOMテキスト  ─▶ Nano(responseConstraint) ─▶ セレクタ
@@ -59,11 +59,10 @@ popup「今すぐ検知」/ 共有開始時(任意)
 ブラウザはプライバシー上「どのタブを共有したか」を呼び出し元に教えない。そこで全タブで協調する:
 
 ```
-共有される側(Gmail) inject: 機密要素を正規化座標(0..1)で publish
-  └─ bridge ─ runtime ─▶ background(全タブの rect を集約)
-                            └─ pickSourceTab で capturer に対応するソースを推定
-共有元(meet) inject: subscribe ◀─ set-remote-rects ─┘
-  └─ 加工パイプラインが「正規化 × フレーム寸法」で適用 → 相手にはマスク、自分は普通
+armed な各タブ inject: 自分の機密要素を正規化座標(0..1)で publish
+  └─ bridge ─ runtime ─▶ background(タブ毎の rect + armed を集約)
+共有元(capturer) inject: subscribe ◀─ set-remote-rects(armed な全タブの rect 集約) ─┘
+  └─ 加工パイプラインが ローカル DOM ∪ リモート rect を「正規化 × フレーム寸法」で適用
 ```
 
 | シナリオ | 要素単位マスク | 緊急の全面マスク |
@@ -72,9 +71,10 @@ popup「今すぐ検知」/ 共有開始時(任意)
 | Meet 等で別タブを共有 | **可能**（クロスタブ協調） | 可能 |
 | ウィンドウ / 画面全体 | 不可(DOM→映像の座標対応が取れない) | 可能 |
 
-- **対応付けはヒューリスティック**: 「機密 rect を持つタブ」を候補に、1つなら確定、複数ならキャプチャ映像との
-  アスペクト比一致＋最新更新で選ぶ（`pickSourceTab`）。**機密タブを複数同時共有すると対応付けが不安定**。
-- **共有される側を arm する必要**: そのタブに手動セレクタを入れる or Nano 検知を走らせて初めて rect が publish される。
+- **fail-closed な対応付け**: ブラウザは「どのタブを映しているか」を教えないため、source を1つに賭けず
+  **armed な全タブ(自分以外)の rect を配り、capturer は ローカル∪リモート を当てる**。
+  単一の機密タブ運用なら過不足なし。**複数の機密タブが同時に開いていると過剰マスク（=安全側の劣化）**になる。
+- **共有される側を arm する必要**: そのタブに手動セレクタを入れる or 「今すぐ検知」を走らせて初めて rect が publish される。
 - スクロール等の変化はイベント＋低頻度 tick で追従するため、わずかな遅延が出る。
 - `displaySurface` がタブ以外のときは popup に警告を出す（黙って劣化させない）。
 
@@ -170,7 +170,6 @@ types/
 lib/                   DOM/Chrome 非依存の純粋ロジック（単体テスト対象）
   messages.ts          メッセージ契約（判別共用体）。全エントリ共通のコントラクト層
   masking.ts           座標マッピング / クランプ / 正規化(クロスタブ)
-  match-source.ts      クロスタブ: キャプチャ surface に対応するソースタブの推定
   image.ts             フレーム縮小サイズ計算
   dom-snapshot.ts      DOM スナップショット整形
   nano-parse.ts        Nano 応答のセレクタ抽出（安全網）
@@ -202,7 +201,7 @@ public/
 
 ### 既知の課題 / 将来
 
-- クロスタブの対応付けは「機密タブ1つ」前提のヒューリスティック（複数同時共有は不安定）。
-- 検知の再実行トリガ（MutationObserver / 定期 re-scan）。現状は手動 + 共有開始時のみ。
+- クロスタブは「armed な全タブの rect を配る」fail-closed 方式。複数の機密タブが同時に開いていると過剰マスクになる。
+- 検知の再実行トリガ（MutationObserver / 定期 re-scan）は未実装。現状は手動「今すぐ検知」のみ。
 - 段階2の「視覚領域 → CSS セレクタ」推定精度は実測前提。
 ```

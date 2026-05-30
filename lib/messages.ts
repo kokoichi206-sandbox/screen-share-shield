@@ -24,8 +24,6 @@ export interface Settings {
   style: MaskStyle;
   blurPx: number;
   selectors: string[];
-  // 共有開始時に AI 自動検知を走らせるか（既定 off: 予期せぬモデルDLを避ける）。
-  autoDetectOnShare: boolean;
   // 段階2(画像)検知を使うか。
   imageStage: boolean;
 }
@@ -35,7 +33,6 @@ export const DEFAULT_SETTINGS: Settings = {
   style: "blur",
   blurPx: 18,
   selectors: [],
-  autoDetectOnShare: false,
   imageStage: true,
 };
 
@@ -83,23 +80,20 @@ export type PageCommand =
   // 自動検知結果の反映（手動 selectors とは別枠）
   | { type: "set-auto-selectors"; selectors: string[] }
   | { type: "clear-auto-selectors" }
-  // クロスタブ: 共有元(capturer)が、共有される側の正規化 rect を受け取り適用する。
-  // crossTab=true は「別タブ共有（リモートソースあり）」を意味し、このとき capturer は
-  // 自分のローカル DOM マスクを使わず remote rect のみを適用する（自分の DOM は共有内容と無関係）。
-  | { type: "set-remote-rects"; rects: NormRect[]; crossTab: boolean }
+  // クロスタブ: 共有元(capturer)が、armed な全タブの正規化 rect(集約)を受け取り適用する。
+  // capturer は常に「ローカル DOM ∪ これらの remote rect」をマスクする(fail-closed)。
+  | { type: "set-remote-rects"; rects: NormRect[] }
   | { type: "get-status" };
 
 // --- page(inject) からの通知イベント: inject -> content ---
 export type PageEvent =
   | { type: "ready" }
   | { type: "status"; status: ShareStatus }
-  // videoW/videoH は capturer のソースタブ対応付け(アスペクト一致)に使う
-  | { type: "share-started"; surface: string; videoW: number; videoH: number }
+  | { type: "share-started"; surface: string }
   | { type: "share-ended" }
   // クロスタブ: このタブ(共有される側)の機密 rect を正規化座標で publish。
-  // aspect = ビューポートの幅/高さ（対応付けの手がかり）。
-  // armed = 機密セレクタを持つか（スクロールで rect が一時的に空でもソース候補を維持するため）。
-  | { type: "publish-rects"; rects: NormRect[]; aspect: number; armed: boolean }
+  // armed = 機密セレクタを持つか（スクロールで rect が一時的に空でも source として集約対象に残す）。
+  | { type: "publish-rects"; rects: NormRect[]; armed: boolean }
   // AI 自動検知の入力(DOM スナップショット + 任意の縮小フレーム dataURL)
   // dataUrl があるときだけ段階2(画像)を走らせる。null なら段階2はスキップ。
   | { type: "detect-payload"; snapshot: string; dataUrl: string | null }
@@ -157,11 +151,10 @@ export type RuntimeMessage =
       channel: typeof CHANNEL;
       kind: "publish-rects";
       rects: NormRect[];
-      aspect: number;
       armed: boolean;
     }
-  // クロスタブ: 共有元 -> background へ「キャプチャ開始、対応ソースの rect をくれ」
-  | { channel: typeof CHANNEL; kind: "subscribe-rects"; captureAspect: number | null }
+  // クロスタブ: 共有元 -> background へ「キャプチャ開始、armed な全タブの rect をくれ」
+  | { channel: typeof CHANNEL; kind: "subscribe-rects" }
   // クロスタブ: 共有元 -> background へ購読解除
   | { channel: typeof CHANNEL; kind: "unsubscribe-rects" };
 
