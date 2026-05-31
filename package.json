@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "画面共有中だけ相手の映像に映る機密情報をマスクする Chrome 拡張（自分の画面はそのまま）。",
+  "license": "MIT",
   "packageManager": "pnpm@9.12.2",
   "scripts": {
     "dev": "wxt",

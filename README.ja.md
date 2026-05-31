@@ -71,3 +71,7 @@ popup — オンデバイス AI がログイン欄（`#login_field`, `#password`
 ## 開発者向け
 
 アーキテクチャ・メッセージ契約・ビルド/テストコマンド・設計トレードオフは **[CLAUDE.md](./CLAUDE.md)** にあります。
+
+## ライセンス
+
+MIT — [LICENSE](./LICENSE) を参照。
