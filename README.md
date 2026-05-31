@@ -72,3 +72,7 @@ content — the masks follow it into the share.
 ## For developers
 
 Architecture, message protocol, build/test commands, and design trade-offs are in **[CLAUDE.md](./CLAUDE.md)**.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
