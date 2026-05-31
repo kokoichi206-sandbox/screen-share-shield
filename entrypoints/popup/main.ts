@@ -168,16 +168,16 @@ function renderNanoReport(report: NanoReport | null, autoCount: number): void {
     return;
   }
   // 検知失敗時はマスクを維持する設計。0件適用と誤解させないよう明示する。
-  if (report.error) {
-    els.detectResult.textContent = `検知失敗: ${report.error}（既存マスクは維持）`;
+  if (!report.ran || report.error) {
+    const why = report.error ?? AVAILABILITY_LABEL[report.availability];
+    els.detectResult.textContent = `検知失敗: ${why}（既存マスクは維持）`;
     return;
   }
-  const parts: string[] = [`自動検知: ${report.selectors.length}件適用`];
-  if (report.text.error) parts.push(`テキスト: ${report.text.error}`);
-  if (report.image.ran || report.image.error) {
-    parts.push(`画像: ${report.image.error ?? `${report.image.count}件`}`);
-  }
-  els.detectResult.textContent = parts.join(" / ");
+  // 画像を実際に使えたか/使わなかった理由を必ず明示する（暗黙 fallback 禁止）。
+  const image = report.image.used
+    ? "画像: 使用"
+    : `画像: 不使用(${report.image.reason ?? "理由不明"})`;
+  els.detectResult.textContent = `自動検知: ${report.count}件適用 / ${image}`;
 }
 
 // --- 操作ハンドラ ---

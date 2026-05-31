@@ -70,13 +70,17 @@ export default defineBackground(() => {
     switch (message.kind) {
       // ---- Nano（非同期応答: sendResponse + return true）----
       case "detect":
+        // 画像フレームは inject の canvas でなく、送信元タブの可視内容を
+        // captureVisibleTab で独立取得する（armed な機密タブでも画像が乗る）。
         respond(
-          runDetection({ snapshot: message.snapshot, dataUrl: message.dataUrl }),
+          detectForRequest(message, sender.tab?.id ?? null, sender.tab?.windowId ?? null),
           sendResponse,
           (e): NanoReport => ({
             selectors: [],
-            text: { ran: false, availability: "unavailable", count: 0, error: String(e) },
-            image: { ran: false, availability: "skipped", count: 0, error: null },
+            ran: false,
+            availability: "unavailable",
+            image: { used: false, reason: "検知に失敗" },
+            count: 0,
             error: String(e),
           }),
         );
@@ -130,6 +134,61 @@ export default defineBackground(() => {
     }
   });
 });
+
+// 送信元タブの可視内容を JPEG dataURL でキャプチャする。captureVisibleTab は
+// 「その window で今可視のタブ」を撮るため、送信元タブが今アクティブでないと DOM
+// スナップショット(送信元タブ)と別タブの画像が混ざる。混ぜず、テキストのみへ倒す
+// （fail-closed: 不確かな画像で誤検知させない）。レート制限・権限失敗も理由を返す。
+async function captureFrame(
+  tabId: number | null,
+  windowId: number | null,
+): Promise<{ dataUrl: string | null; reason: string | null }> {
+  if (tabId == null || windowId == null) {
+    return { dataUrl: null, reason: "送信元タブが不明（テキストのみ）" };
+  }
+  let activeId: number | undefined;
+  try {
+    const [active] = await browser.tabs.query({ active: true, windowId });
+    activeId = active?.id;
+  } catch (e) {
+    return { dataUrl: null, reason: `アクティブタブ確認に失敗: ${String(e)}` };
+  }
+  if (activeId !== tabId) {
+    return { dataUrl: null, reason: "送信元タブが非アクティブのため画像なし（テキストのみ）" };
+  }
+  try {
+    const dataUrl = await browser.tabs.captureVisibleTab(windowId, {
+      format: "jpeg",
+      quality: 80,
+    });
+    return { dataUrl, reason: null };
+  } catch (e) {
+    return { dataUrl: null, reason: `画面キャプチャ失敗: ${String(e)}` };
+  }
+}
+
+// detect 依頼を処理する。wantImage のときだけフレームを取り、DOM+画像を統合検知する。
+// 画像が取れない/未要求のときは理由を明示してテキストのみで検知する（暗黙 fallback 禁止）。
+function detectForRequest(
+  message: Extract<RuntimeMessage, { kind: "detect" }>,
+  tabId: number | null,
+  windowId: number | null,
+): Promise<NanoReport> {
+  if (!message.wantImage) {
+    return runDetection({
+      snapshot: message.snapshot,
+      dataUrl: null,
+      imageSkipReason: "画像リクエストなし（テキストのみ）",
+    });
+  }
+  return captureFrame(tabId, windowId).then(({ dataUrl, reason }) =>
+    runDetection({
+      snapshot: message.snapshot,
+      dataUrl,
+      imageSkipReason: reason,
+    }),
+  );
+}
 
 // capturer へ「armed な全タブ(自分以外)の rect を集約したもの」を配る。
 // どのタブを映しているか特定できないため、1つに賭けず全 armed タブ分を当てる(fail-closed)。

@@ -85,7 +85,7 @@ export default defineContentScript({
           });
           return;
         case "detect-payload":
-          // 大きい dataURL を含むので popup には転送せず、ここで background に渡す。
+          // popup には転送せず、ここで background に渡す（画像は background が取得する）。
           void handleDetectPayload(evt);
           return;
       }
@@ -136,7 +136,8 @@ export default defineContentScript({
       safeSend({ channel: CHANNEL, kind: "unsubscribe-rects" });
     }
 
-    // 段階1/2 のペイロードを background(Nano) に渡し、結果を inject へ反映する。
+    // 検知ペイロード(DOM スナップショット)を background(Nano) に渡し、結果を inject へ反映する。
+    // 画像フレームは background が captureVisibleTab で取得する。
     async function handleDetectPayload(
       evt: Extract<PageEvent, { type: "detect-payload" }>,
     ): Promise<void> {
@@ -145,16 +146,13 @@ export default defineContentScript({
           channel: CHANNEL,
           kind: "detect",
           snapshot: evt.snapshot,
-          dataUrl: evt.dataUrl,
+          wantImage: evt.wantImage,
         })) as DetectResponse | undefined;
         if (!report) return;
         lastNanoReport = report;
-        // fail-closed: いずれかの段階が「実行され、かつエラー無し」のときだけ自動枠を更新する。
+        // fail-closed: 「実行され、かつエラー無し」のときだけ自動枠を更新する。
         // 検知が成功して 0 件 → 空に更新(正当)。利用不可/prompt失敗 → 既存マスクを維持(外さない)。
-        const succeeded =
-          (report.text.ran && report.text.error == null) ||
-          (report.image.ran && report.image.error == null);
-        if (succeeded) {
+        if (report.ran && report.error == null) {
           // id を載せて返す。inject は最新の検知に対する結果だけ採用する（順序逆転対策）。
           toPage({ type: "set-auto-selectors", selectors: report.selectors, id: evt.id });
         }
@@ -164,8 +162,10 @@ export default defineContentScript({
         // エラーは lastNanoReport に記録し popup へ明示する。
         lastNanoReport = {
           selectors: [],
-          text: { ran: false, availability: "unavailable", count: 0, error: String(e) },
-          image: { ran: false, availability: "skipped", count: 0, error: null },
+          ran: false,
+          availability: "unavailable",
+          image: { used: false, reason: "検知に失敗" },
+          count: 0,
           error: String(e),
         };
       }

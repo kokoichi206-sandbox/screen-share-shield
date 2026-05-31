@@ -14,17 +14,14 @@ export type NanoState =
   | "downloading"
   | "available";
 
-// 検知段階の状態。availability 4 値に加え、入力不足で段階を実行しなかった "skipped" を持つ。
-// （"skipped" は「このデバイスが非対応」ではなく「フレーム未取得等で今回は走らせなかった」を意味する）
-export type StageAvailability = NanoState | "skipped";
-
 // storage に永続化する設定（forceAll は一時状態なので含めない）。
 export interface Settings {
   enabled: boolean;
   style: MaskStyle;
   blurPx: number;
   selectors: string[];
-  // 段階2(画像)検知を使うか。
+  // 手動「今すぐ検知」で画像も使うか（DOM+画像のマルチモーダル統合検知）。
+  // 自動再検知は常にテキストのみで、このフラグの影響を受けない。
   imageStage: boolean;
 }
 
@@ -48,20 +45,21 @@ export interface ShareStatus {
   autoSelectors: string[]; // Nano 自動検知セレクタ（手動とは別枠）
 }
 
-// AI 自動検知の各段階の結果。
-export interface StageReport {
-  ran: boolean;
-  availability: StageAvailability;
-  count: number;
-  error: string | null;
+// 画像(マルチモーダル)を実際に検知へ使えたか。used=false のときは理由を必ず持つ。
+// （暗黙 fallback 禁止: 「画像を使わなかった」事実と理由を popup へ明示するため）
+export interface ImageUsage {
+  used: boolean;
+  reason: string | null;
 }
 
-// AI 自動検知の総合結果。
+// AI 自動検知の結果。DOM スナップショット(+任意で画像)を1回の呼び出しで処理する。
 export interface NanoReport {
   selectors: string[];
-  text: StageReport;
-  image: StageReport;
-  error: string | null;
+  ran: boolean; // モデルが結果を返したか（availability ゲートを通過したか）
+  availability: NanoState; // テキストモデルの可用性（検知全体のゲート）
+  image: ImageUsage; // 画像を使えたか / 使わなかった理由
+  count: number;
+  error: string | null; // 呼び出しエラー（ran=true でも失敗ならここに入る）
 }
 
 // --- page(inject) を操作するコマンド: content/popup/background -> inject ---
@@ -98,10 +96,10 @@ export type PageEvent =
   // クロスタブ: このタブ(共有される側)の機密 rect を正規化座標で publish。
   // armed = 機密セレクタを持つか（スクロールで rect が一時的に空でも source として集約対象に残す）。
   | { type: "publish-rects"; rects: NormRect[]; armed: boolean }
-  // AI 自動検知の入力(DOM スナップショット + 任意の縮小フレーム dataURL)
-  // dataUrl があるときだけ段階2(画像)を走らせる。null なら段階2はスキップ。
+  // AI 自動検知の入力(DOM スナップショット)。wantImage=true のとき background が
+  // captureVisibleTab でフレームを取り、DOM+画像を1回のマルチモーダル呼び出しに統合する。
   // id は検知の世代。結果(set-auto-selectors)に同じ id を載せて順序逆転を防ぐ。
-  | { type: "detect-payload"; snapshot: string; dataUrl: string | null; id: number }
+  | { type: "detect-payload"; snapshot: string; wantImage: boolean; id: number }
   | { type: "warning"; code: string; surface: string; message: string }
   | { type: "error"; where: string; message: string };
 
@@ -140,12 +138,13 @@ export type RuntimeMessage =
   | { channel: typeof CHANNEL; kind: "command"; cmd: PageCommand }
   // popup -> bridge: 現在の共有状態 + 直近の Nano 結果を問い合わせ
   | { channel: typeof CHANNEL; kind: "query-status" }
-  // bridge -> background: AI 検知の実行依頼（dataUrl があれば段階2も走る）
+  // bridge -> background: AI 検知の実行依頼。wantImage=true なら background が
+  // captureVisibleTab でフレームを取り、DOM+画像を統合して検知する。
   | {
       channel: typeof CHANNEL;
       kind: "detect";
       snapshot: string;
-      dataUrl: string | null;
+      wantImage: boolean;
     }
   // popup -> background: Nano の利用可否問い合わせ
   | { channel: typeof CHANNEL; kind: "nano-availability" }

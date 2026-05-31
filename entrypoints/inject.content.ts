@@ -18,7 +18,6 @@ import {
   type ViewportRect,
 } from "@/lib/masking";
 import { buildSnapshot, type ElementMeta } from "@/lib/dom-snapshot";
-import { computeDownscaleSize } from "@/lib/image";
 
 // MAIN world で動く本体。
 // navigator.mediaDevices.getDisplayMedia を差し替え、返ってきた映像を <canvas> で
@@ -49,12 +48,8 @@ export default defineContentScript({
       sharedLive: false, // background が通知する「今 capturer に共有されている」状態
     };
 
-    // 段階2(画像)検知のために、稼働中パイプラインの canvas を参照しておく。
-    let currentCanvas: HTMLCanvasElement | null = null;
-
     // AI 自動再検知。手動「今すぐ検知」で arm され、以降は遷移/DOM変化/操作で再検知する。
     let autoDetectArmed = false;
-    let autoIncludeImage = false;
     let lastDetectSnapshot = "";
     let domObserver: MutationObserver | null = null;
     let detectSeq = 0; // 検知の世代カウンタ
@@ -183,29 +178,6 @@ export default defineContentScript({
       return buildSnapshot(metas, maxChars);
     }
 
-    // 段階2: 稼働中 canvas を縮小して JPEG dataURL 文字列にする（runtime 経由で運ぶため）。
-    // 未共有(canvas 無し)/tainted の場合は null を返し、段階2をスキップさせる。
-    function sampleFrame(maxEdge = 1024): string | null {
-      if (!currentCanvas?.width || !currentCanvas.height) return null;
-      const { width, height } = computeDownscaleSize(
-        currentCanvas.width,
-        currentCanvas.height,
-        maxEdge,
-      );
-      if (!width || !height) return null;
-      const off = document.createElement("canvas");
-      off.width = width;
-      off.height = height;
-      const octx = off.getContext("2d");
-      if (!octx) return null;
-      octx.drawImage(currentCanvas, 0, 0, width, height);
-      try {
-        return off.toDataURL("image/jpeg", 0.7);
-      } catch {
-        return null; // tainted canvas 等は段階2をスキップ
-      }
-    }
-
     window.addEventListener("message", (e: MessageEvent) => {
       if (e.source !== window) return;
       if (!isToPageMessage(e.data)) return;
@@ -258,8 +230,9 @@ export default defineContentScript({
           break;
         case "run-detection": {
           // 手動検知。以降の自動再検知を arm し、今回は強制実行する。
-          armAutoDetect(cmd.includeImage);
-          emitDetect(true);
+          // 画像は手動検知のときだけ要求する（自動再検知は DOM のみ）。
+          armAutoDetect();
+          emitDetect(true, cmd.includeImage);
           break;
         }
         case "set-auto-selectors":
@@ -355,13 +328,13 @@ export default defineContentScript({
 
     // 検知ペイロードを送る。force でなければ DOM スナップショットが前回と同じなら送らない
     // （Nano の無駄打ちを防ぐ）。id を採番し、結果はこの id と一致するものだけ採用する。
-    function emitDetect(force: boolean): void {
+    // wantImage のとき background が captureVisibleTab でフレームを取り、画像も使って検知する。
+    function emitDetect(force: boolean, wantImage: boolean): void {
       const snapshot = collectDomSnapshot();
       if (!force && snapshot === lastDetectSnapshot) return;
       lastDetectSnapshot = snapshot;
-      const dataUrl = autoIncludeImage ? sampleFrame() : null;
       lastEmittedDetectId = ++detectSeq;
-      emit({ type: "detect-payload", snapshot, dataUrl, id: lastEmittedDetectId });
+      emit({ type: "detect-payload", snapshot, wantImage, id: lastEmittedDetectId });
     }
 
     // 遷移/変化/操作が落ち着いてから、共有中(自タブ or 被共有)かつ可視のときだけ再検知する。
@@ -371,7 +344,7 @@ export default defineContentScript({
       () => {
         if (!autoDetectArmed || document.hidden) return;
         if (!state.sharing && !state.sharedLive) return; // 共有中のときだけ Nano を起動
-        emitDetect(false);
+        emitDetect(false, false); // 自動再検知は DOM のみ（画像は手動検知だけ）
       },
       1000,
       4000,
@@ -398,8 +371,7 @@ export default defineContentScript({
       };
     }
 
-    function armAutoDetect(includeImage: boolean): void {
-      autoIncludeImage = includeImage;
+    function armAutoDetect(): void {
       if (autoDetectArmed) return;
       autoDetectArmed = true;
       patchHistory();
@@ -450,7 +422,6 @@ export default defineContentScript({
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d", { alpha: false });
       if (!ctx) throw new Error("2D コンテキストを取得できません");
-      currentCanvas = canvas;
 
       const fps = Math.min(settings.frameRate ?? 30, 30);
       let rvfcHandle: number | null = null;
@@ -550,7 +521,6 @@ export default defineContentScript({
         // セッション/音声トラックが生き残るのを防ぐ。
         for (const t of srcStream.getTracks()) t.stop();
         video.srcObject = null;
-        if (currentCanvas === canvas) currentCanvas = null;
       }
 
       // ユーザーがブラウザUIから共有停止 -> 元トラックが ended -> 後始末

@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   SELECTOR_SCHEMA,
+  buildMultimodalPrompt,
   buildTextPrompt,
   getAvailability,
-  mergeSelectors,
   runDetection,
   startDownload,
 } from "@/lib/nano-detect";
@@ -35,37 +35,45 @@ describe("buildTextPrompt", () => {
   });
 });
 
-describe("mergeSelectors", () => {
-  it("2配列を結合し重複を除去(順序維持)", () => {
-    expect(mergeSelectors([".a", ".b"], [".b", ".c"])).toEqual([".a", ".b", ".c"]);
+describe("buildMultimodalPrompt", () => {
+  it("スナップショットを本文に埋め込む", () => {
+    const snap = "#card-number text=\"4242\"";
+    const prompt = buildMultimodalPrompt(snap);
+    expect(prompt).toContain(snap);
+    expect(prompt).toContain("selectors");
   });
 
-  it("空同士は空", () => {
-    expect(mergeSelectors([], [])).toEqual([]);
+  it("画像を視覚的文脈として使う指示を含む", () => {
+    expect(buildMultimodalPrompt("x")).toContain("画像");
+  });
+
+  it("一覧に実在するセレクタのみ返す grounding 指示を含む", () => {
+    // ピクセルからのセレクタ当てずっぽうを禁じる中核ルール。
+    expect(buildMultimodalPrompt("x")).toContain("実在する");
   });
 });
 
 describe("runDetection (LanguageModel 不在=node)", () => {
-  it("dataUrl 無しは画像段階を skipped と明示し、不在を握りつぶさない", async () => {
+  it("画像なし要求でも不在を握りつぶさず明示する", async () => {
     const r = await runDetection({ snapshot: "#x", dataUrl: null });
     expect(r.selectors).toEqual([]);
-    expect(r.text.ran).toBe(false);
-    expect(r.text.availability).toBe("unavailable");
-    expect(r.text.error).toBeTruthy();
-    expect(r.image.ran).toBe(false);
-    expect(r.image.availability).toBe("skipped"); // unavailable とは区別する
+    expect(r.ran).toBe(false);
+    expect(r.availability).toBe("unavailable");
     expect(r.error).toBe("Gemini Nano が利用できません");
+    expect(r.image.used).toBe(false);
+    expect(r.image.reason).toBeTruthy();
   });
 
-  it("dataUrl 有りでも不在なら両段階が明示エラー(空で握りつぶさない)", async () => {
+  it("画像あり要求でも不在なら明示エラー(空で握りつぶさない)", async () => {
     const r = await runDetection({
       snapshot: "#x",
       dataUrl: "data:image/jpeg;base64,/9j/",
     });
-    expect(r.text.availability).toBe("unavailable");
-    expect(r.image.availability).toBe("unavailable"); // runImageStage を通る
-    expect(r.image.error).toBeTruthy();
     expect(r.selectors).toEqual([]);
+    expect(r.ran).toBe(false);
+    expect(r.availability).toBe("unavailable");
+    expect(r.image.used).toBe(false);
+    expect(r.error).toBeTruthy();
   });
 });
 
